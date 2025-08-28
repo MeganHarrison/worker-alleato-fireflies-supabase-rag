@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fireflies-Supabase RAG Worker Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            color: white;
+            margin-bottom: 40px;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.95;
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .status-card {
+            background: white;
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .status-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(0,0,0,0.15);
+        }
+
+        .status-card h3 {
+            color: #4a5568;
+            margin-bottom: 20px;
+            font-size: 1.1rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .status-value {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: #2d3748;
+            margin-bottom: 8px;
+        }
+
+        .status-label {
+            color: #718096;
+            font-size: 0.9rem;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+
+        .status-healthy {
+            background-color: #48bb78;
+        }
+
+        .status-warning {
+            background-color: #f6ad55;
+        }
+
+        .status-error {
+            background-color: #fc8181;
+        }
+
+        @keyframes pulse {
+            0% {
+                box-shadow: 0 0 0 0 rgba(72, 187, 120, 0.7);
+            }
+            70% {
+                box-shadow: 0 0 0 10px rgba(72, 187, 120, 0);
+            }
+            100% {
+                box-shadow: 0 0 0 0 rgba(72, 187, 120, 0);
+            }
+        }
+
+        .main-stats {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 30px;
+            margin-top: 20px;
+        }
+
+        .stat-item {
+            text-align: center;
+            padding: 20px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+        }
+
+        .stat-number {
+            font-size: 2rem;
+            font-weight: bold;
+            color: #2d3748;
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            color: #4a5568;
+            font-size: 0.9rem;
+        }
+
+        .action-buttons {
+            display: flex;
+            gap: 15px;
+            margin-top: 30px;
+            justify-content: center;
+        }
+
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-secondary {
+            background: #e2e8f0;
+            color: #4a5568;
+        }
+
+        .btn-secondary:hover {
+            background: #cbd5e0;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255,255,255,.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .error-message {
+            background: #fed7d7;
+            color: #9b2c2c;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 20px 0;
+            display: none;
+        }
+
+        .last-update {
+            text-align: center;
+            color: #718096;
+            margin-top: 20px;
+            font-size: 0.9rem;
+        }
+
+        .chart-container {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 30px;
+            background: #e2e8f0;
+            border-radius: 15px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            border-radius: 15px;
+            transition: width 0.5s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+        }
+
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 1.8rem;
+            }
+            .status-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔥 Fireflies-Supabase RAG Worker</h1>
+            <p>Real-time monitoring dashboard for meeting transcript processing</p>
+        </div>
+
+        <div class="status-grid">
+            <div class="status-card">
+                <h3>System Status</h3>
+                <div id="system-status">
+                    <span class="status-indicator status-healthy"></span>
+                    <span class="status-value">Checking...</span>
+                </div>
+                <div class="status-label">Worker Health</div>
+            </div>
+
+            <div class="status-card">
+                <h3>Last Sync</h3>
+                <div class="status-value" id="last-sync">--</div>
+                <div class="status-label" id="last-sync-relative">Never synced</div>
+            </div>
+
+            <div class="status-card">
+                <h3>Next Sync</h3>
+                <div class="status-value" id="next-sync">--</div>
+                <div class="status-label">Daily at 2:00 AM UTC</div>
+            </div>
+        </div>
+
+        <div class="main-stats">
+            <h2 style="color: #2d3748; margin-bottom: 20px;">📊 Statistics Overview</h2>
+            
+            <div class="stats-grid">
+                <div class="stat-item">
+                    <div class="stat-number" id="total-meetings">0</div>
+                    <div class="stat-label">Total Meetings</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-number" id="total-chunks">0</div>
+                    <div class="stat-label">Total Chunks</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-number" id="avg-chunks">0</div>
+                    <div class="stat-label">Avg Chunks/Meeting</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-number" id="storage-size">0 MB</div>
+                    <div class="stat-label">Storage Used</div>
+                </div>
+            </div>
+
+            <div style="margin-top: 30px;">
+                <h3 style="color: #4a5568; margin-bottom: 15px;">Processing Status</h3>
+                <div id="processing-stats">
+                    <p style="color: #718096;">Last sync processed: <strong id="last-processed">0</strong> transcripts</p>
+                    <p style="color: #718096;">Failed: <strong id="last-failed">0</strong> transcripts</p>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="success-rate" style="width: 0%">0%</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <h2 style="color: #2d3748; margin-bottom: 20px;">🏢 Meetings by Department</h2>
+            <div id="department-stats" class="stats-grid">
+                <!-- Department stats will be populated here -->
+            </div>
+        </div>
+
+        <div class="error-message" id="error-message">
+            Error connecting to worker. Please check if the worker is deployed.
+        </div>
+
+        <div class="action-buttons">
+            <button class="btn btn-primary" onclick="syncNow()">
+                <span id="sync-btn-text">Sync Now</span>
+                <span id="sync-loading" class="loading" style="display: none;"></span>
+            </button>
+            <button class="btn btn-secondary" onclick="refreshStats()">Refresh Stats</button>
+            <button class="btn btn-secondary" onclick="testSearch()">Test Search</button>
+        </div>
+
+        <div class="last-update" id="last-update">
+            Last updated: Never
+        </div>
+    </div>
+
+    <script>
+        // Configuration - Update this with your worker URL
+        const WORKER_URL = 'https://worker-alleato-fireflies-rag.megankharrison.workers.dev';
+        
+        // You can also use localhost for testing
+        // const WORKER_URL = 'http://localhost:8787';
+
+        let refreshInterval;
+
+        async function fetchStats() {
+            try {
+                // Fetch health status
+                const healthResponse = await fetch(`${WORKER_URL}/api/health`);
+                if (healthResponse.ok) {
+                    const health = await healthResponse.json();
+                    updateHealthStatus(health);
+                } else {
+                    showError('Worker is not responding');
+                    return;
+                }
+
+                // Fetch analytics
+                const analyticsResponse = await fetch(`${WORKER_URL}/api/analytics`);
+                if (analyticsResponse.ok) {
+                    const analytics = await analyticsResponse.json();
+                    updateAnalytics(analytics);
+                }
+
+                hideError();
+            } catch (error) {
+                console.error('Error fetching stats:', error);
+                showError('Failed to connect to worker. Is it deployed?');
+                updateHealthStatus({ status: 'error' });
+            }
+        }
+
+        function updateHealthStatus(health) {
+            const statusElement = document.querySelector('#system-status .status-value');
+            const indicatorElement = document.querySelector('.status-indicator');
+            
+            if (health.status === 'healthy') {
+                statusElement.textContent = 'Healthy';
+                indicatorElement.className = 'status-indicator status-healthy';
+            } else {
+                statusElement.textContent = 'Error';
+                indicatorElement.className = 'status-indicator status-error';
+            }
+        }
+
+        function updateAnalytics(analytics) {
+            // Update main stats
+            document.getElementById('total-meetings').textContent = 
+                analytics.meetings?.total || 0;
+            document.getElementById('total-chunks').textContent = 
+                analytics.chunks?.total || 0;
+            document.getElementById('avg-chunks').textContent = 
+                Math.round(analytics.chunks?.averagePerMeeting || 0);
+            document.getElementById('storage-size').textContent = 
+                analytics.storage?.totalSize || '0 MB';
+
+            // Update last sync info
+            if (analytics.processing?.lastSync) {
+                const lastSyncDate = new Date(analytics.processing.lastSync);
+                document.getElementById('last-sync').textContent = 
+                    lastSyncDate.toLocaleTimeString();
+                document.getElementById('last-sync-relative').textContent = 
+                    getRelativeTime(lastSyncDate);
+                
+                document.getElementById('last-processed').textContent = 
+                    analytics.processing.lastSyncProcessed || 0;
+                document.getElementById('last-failed').textContent = 
+                    analytics.processing.lastSyncFailed || 0;
+                
+                // Calculate success rate
+                const total = (analytics.processing.lastSyncProcessed || 0) + 
+                             (analytics.processing.lastSyncFailed || 0);
+                const successRate = total > 0 ? 
+                    Math.round((analytics.processing.lastSyncProcessed / total) * 100) : 0;
+                
+                const progressBar = document.getElementById('success-rate');
+                progressBar.style.width = `${successRate}%`;
+                progressBar.textContent = `${successRate}% Success`;
+            }
+
+            // Update next sync time
+            const now = new Date();
+            const nextSync = new Date();
+            nextSync.setUTCHours(2, 0, 0, 0);
+            if (nextSync < now) {
+                nextSync.setDate(nextSync.getDate() + 1);
+            }
+            document.getElementById('next-sync').textContent = 
+                `${Math.round((nextSync - now) / (1000 * 60 * 60))}h ${Math.round(((nextSync - now) % (1000 * 60 * 60)) / (1000 * 60))}m`;
+
+            // Update department stats
+            if (analytics.meetings?.byDepartment) {
+                const deptContainer = document.getElementById('department-stats');
+                deptContainer.innerHTML = '';
+                
+                for (const [dept, count] of Object.entries(analytics.meetings.byDepartment)) {
+                    const statItem = document.createElement('div');
+                    statItem.className = 'stat-item';
+                    statItem.innerHTML = `
+                        <div class="stat-number">${count}</div>
+                        <div class="stat-label">${dept}</div>
+                    `;
+                    deptContainer.appendChild(statItem);
+                }
+            }
+
+            // Update last update time
+            document.getElementById('last-update').textContent = 
+                `Last updated: ${new Date().toLocaleTimeString()}`;
+        }
+
+        function getRelativeTime(date) {
+            const seconds = Math.floor((new Date() - date) / 1000);
+            
+            if (seconds < 60) return 'Just now';
+            if (seconds < 3600) return `${Math.floor(seconds / 60)} minutes ago`;
+            if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours ago`;
+            return `${Math.floor(seconds / 86400)} days ago`;
+        }
+
+        async function syncNow() {
+            const btnText = document.getElementById('sync-btn-text');
+            const loading = document.getElementById('sync-loading');
+            
+            btnText.style.display = 'none';
+            loading.style.display = 'inline-block';
+            
+            try {
+                const response = await fetch(`${WORKER_URL}/api/sync`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ limit: 10 })
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    alert(`Sync completed!\nProcessed: ${result.processed}\nFailed: ${result.failed}`);
+                    fetchStats(); // Refresh stats
+                } else {
+                    alert('Sync failed: ' + (result.error || 'Unknown error'));
+                }
+            } catch (error) {
+                alert('Failed to trigger sync: ' + error.message);
+            } finally {
+                btnText.style.display = 'inline';
+                loading.style.display = 'none';
+            }
+        }
+
+        async function testSearch() {
+            const query = prompt('Enter a search query:', 'action items');
+            if (!query) return;
+            
+            try {
+                const response = await fetch(`${WORKER_URL}/api/search`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query, options: { limit: 5 } })
+                });
+                
+                const result = await response.json();
+                
+                if (result.results && result.results.length > 0) {
+                    alert(`Found ${result.results.length} results!\n\nTop result:\n${result.results[0].text.substring(0, 200)}...`);
+                } else {
+                    alert('No results found for your query.');
+                }
+            } catch (error) {
+                alert('Search failed: ' + error.message);
+            }
+        }
+
+        function refreshStats() {
+            fetchStats();
+        }
+
+        function showError(message) {
+            const errorElement = document.getElementById('error-message');
+            errorElement.textContent = message;
+            errorElement.style.display = 'block';
+        }
+
+        function hideError() {
+            document.getElementById('error-message').style.display = 'none';
+        }
+
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchStats();
+            
+            // Auto-refresh every 30 seconds
+            refreshInterval = setInterval(fetchStats, 30000);
+        });
+
+        // Clean up on page unload
+        window.addEventListener('beforeunload', () => {
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+            }
+        });
+    </script>
+</body>
+</html>
