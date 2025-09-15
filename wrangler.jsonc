@@ -30,9 +30,9 @@
     }
   ],
 
-  // Scheduled trigger for automatic sync every day at 2 AM
+  // Scheduled trigger for automatic sync every 30 minutes
   "triggers": {
-    "crons": ["0 2 * * *"]
+    "crons": ["*/30 * * * *"]
   },
 
   // Environment variables

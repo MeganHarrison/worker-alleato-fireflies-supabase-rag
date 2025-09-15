@@ -1,1170 +1,1091 @@
-import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import postgres from 'postgres';
-import { 
-  Env, 
-  TranscriptMetadata, 
-  TranscriptChunk, 
-  VectorSearchResult,
-  FirefliesTranscript,
-  FirefliesWebhookPayload,
-  ProcessingOptions,
-  SearchOptions,
-  SyncResult,
-  AnalyticsData,
-  ConversationThread,
-  WebhookVerification
-} from './types';
-import { CacheService } from './services/cache';
-import { RateLimiter } from './services/rate-limiter';
-import { Logger } from './services/logger';
+/*
+ * Fireflies Ingest Worker (Cloudflare Workers)
+ * ------------------------------------------------------------
+ * Purpose
+ *   - Receive Fireflies transcripts (via webhook or on-demand sync)
+ *   - Format to Markdown and upload to Supabase Storage (bucket: "meetings")
+ *   - Upsert a meeting record in Postgres/Supabase and return its meeting.id
+ *   - Trigger a dedicated Vectorizer Worker that handles chunking + OpenAI embeddings
+ *   - Provide light analytics and vector search (reads DB only)
+ *
+ * Responsibilities owned HERE
+ *   ✓ Fireflies GraphQL client (fetch transcript lists and full transcript)
+ *   ✓ Supabase Storage write of markdown transcript
+ *   ✓ Postgres insert/upsert of meetings row (returns meeting.id)
+ *   ✓ Webhook verification (HMAC) + rate limiting + basic status endpoints
+ *   ✓ Dispatch to Vectorizer Worker: POST { meetingId }
+ *
+ * Responsibilities delegated to VECTORIZE WORKER (OpenAI)
+ *   → Chunk transcript
+ *   → Generate embeddings with OpenAI (e.g., text-embedding-3-large)
+ *   → Insert meeting_chunks rows (with pgvector embeddings)
+ *   → Update meetings.processing_status, processed_at, processing_error
+ *
+ * Required environment bindings (wrangler.toml)
+ *   vars = {
+ *     SUPABASE_URL = "...",
+ *     SUPABASE_SERVICE_KEY = "...",
+ *     FIREFLIES_API_KEY = "...",
+ *     FIREFLIES_WEBHOOK_SECRET = "...",
+ *     VECTORIZE_WORKER_URL = "https://your-vectorizer.workers.dev",
+ *     WORKER_AUTH_TOKEN = "long-random-token",
+ *     SYNC_BATCH_SIZE = 25,
+ *     RATE_LIMIT_REQUESTS = 60,
+ *     RATE_LIMIT_WINDOW = 60
+ *   }
+ *   [[kv_namespaces]]
+ *     binding = "CACHE"
+ *     id = "<kv-id>"
+ */
+
+import { createClient, SupabaseClient } from "@supabase/supabase-js";
+import postgres from "postgres";
+
+// ===== Types =====
+export interface Env {
+  SUPABASE_URL: string;
+  SUPABASE_SERVICE_KEY: string;
+  DATABASE_URL?: string; // direct Postgres URL (preferred)
+  HYPERDRIVE?: { connectionString: string }; // optional fallback
+
+  FIREFLIES_API_KEY: string;
+  FIREFLIES_WEBHOOK_SECRET?: string;
+
+  VECTORIZE_WORKER_URL: string; // e.g. https://vectorizer.example.workers.dev
+  WORKER_AUTH_TOKEN: string; // bearer for vectorizer
+
+  SYNC_BATCH_SIZE: number; // default batch size for /api/sync & cron
+  RATE_LIMIT_REQUESTS: number; // e.g. 60
+  RATE_LIMIT_WINDOW: number; // seconds, e.g. 60
+
+  CACHE: KVNamespace; // KV for rate limiting, simple flags
+}
+
+// Fireflies GraphQL shapes (partial)
+export interface FirefliesTranscript {
+  id: string;
+  title: string;
+  transcript_url?: string;
+  duration?: number; // seconds
+  date: string; // ISO
+  participants: string[];
+  sentences?: Array<{ text: string; speaker_id: string; start_time: number }>; // optional on list, present on detail
+  summary?: { 
+    keywords?: string[]; 
+    action_items?: string[];
+    overview?: string;
+    bullet_gist?: string[];
+  };
+}
+
+export interface TranscriptMetadata {
+  id: string; // use Fireflies id as external id, stored in raw metadata and/or transcript_id
+  title: string;
+  date: string; // ISO
+  duration?: number; // seconds
+  participants: string[];
+  speakerCount?: number;
+  summary?: { 
+    keywords?: string[]; 
+    action_items?: string[];
+    overview?: string;
+    bullet_gist?: string[];
+  };
+}
+
+export interface ProcessingOptions {
+  detectSentiment?: boolean; // placeholder for later enrichment
+}
+
+export interface SearchOptions {
+  limit?: number;
+  threshold?: number; // cosine similarity threshold (converted via pgvector <=>)
+  filters?: {
+    department?: string;
+    project?: string;
+    dateFrom?: string;
+    dateTo?: string;
+  };
+  includeHighlights?: boolean;
+}
+
+export interface VectorSearchResult {
+  chunk: any;
+  similarity: number;
+  metadata: any;
+  highlight?: string;
+}
+
+export interface SyncResult {
+  success: boolean;
+  processed: number;
+  failed: number;
+  errors?: Array<{ transcript_id: string; error: string }>;
+}
+
+export interface AnalyticsData {
+  meetings: {
+    total: number;
+    lastWeek: number;
+    lastMonth: number;
+    byDepartment: Record<string, number>;
+    byMeetingType: Record<string, number>;
+  };
+  chunks: {
+    total: number;
+    averagePerMeeting: number;
+    withSpeaker: number;
+    withThread: number;
+  };
+  storage: { filesCount: number; totalSize: string; averageFileSize: string };
+  processing: {
+    lastSync: string | null;
+    lastSyncDuration: number;
+    lastSyncProcessed: number;
+    lastSyncFailed: number;
+    averageProcessingTime: number;
+  };
+  search: {
+    totalSearches: number;
+    averageResponseTime: number;
+    cacheHitRate: number;
+  };
+  totalMeetings: number;
+  totalDuration: number;
+  averageDuration: number;
+  topSpeakers: Array<{ name: string; count: number }>;
+  topKeywords: Array<{ keyword: string; frequency: number }>;
+  departmentBreakdown: Array<{ department: string | null; count: number }>;
+  projectBreakdown: Array<{ project: string | null; count: number }>;
+  sentimentAnalysis: { positive: number; neutral: number; negative: number };
+}
+
+export interface WebhookVerification {
+  isValid: boolean;
+  signature?: string | null;
+  timestamp?: string | null;
+}
+
+// ===== Minimal Logger =====
+class Logger {
+  constructor(
+    private level: "debug" | "info" | "warn" | "error" = "info",
+    private ctx: Record<string, any> = {},
+  ) {}
+  setContext(ctx: Record<string, any>) {
+    this.ctx = { ...this.ctx, ...ctx };
+  }
+  child(extra: Record<string, any>) {
+    return new Logger(this.level, { ...this.ctx, ...extra });
+  }
+  private log(
+    kind: string,
+    msg: string,
+    error?: unknown,
+    extra?: Record<string, any>,
+  ) {
+    const base = {
+      t: new Date().toISOString(),
+      lvl: kind,
+      msg,
+      ...this.ctx,
+      ...(extra || {}),
+    };
+    // Avoid leaking secrets if ever included
+    console.log(
+      JSON.stringify(error ? { ...base, error: String(error) } : base),
+    );
+  }
+  debug(msg: string, extra?: any) {
+    this.log("debug", msg, undefined, extra);
+  }
+  info(msg: string, extra?: any) {
+    this.log("info", msg, undefined, extra);
+  }
+  warn(msg: string, extra?: any) {
+    this.log("warn", msg, undefined, extra);
+  }
+  error(msg: string, error?: Error, extra?: any) {
+    this.log("error", msg, error, extra);
+  }
+}
+
+// ===== KV-backed Cache (simple flags) =====
+class CacheService {
+  constructor(private kv: KVNamespace, private defaultTTLSeconds = 3600) {}
+  async get(namespace: string, key: string): Promise<any | null> {
+    return this.kv.get(`${namespace}:${key}`, "json");
+  }
+  async set(namespace: string, key: string, value: any, ttlSec?: number) {
+    await this.kv.put(`${namespace}:${key}`, JSON.stringify(value), {
+      expirationTtl: ttlSec ?? this.defaultTTLSeconds,
+    });
+  }
+}
+
+// ===== KV-backed Rate Limiter =====
+class RateLimiter {
+  constructor(
+    private kv: KVNamespace,
+    private maxReq: number,
+    private windowSec: number,
+  ) {}
+  private bucketKey(id: string) {
+    return `rl:${id}:${Math.floor(Date.now() / 1000 / this.windowSec)}`;
+  }
+  async checkLimit(id: string) {
+    const key = this.bucketKey(id);
+    const current = Number(await this.kv.get(key)) || 0;
+    if (current >= this.maxReq) {
+      return { allowed: false, remaining: 0, reset: this.windowSec };
+    }
+    await this.kv.put(key, String(current + 1), {
+      expirationTtl: this.windowSec + 5,
+    });
+    return {
+      allowed: true,
+      remaining: Math.max(0, this.maxReq - current - 1),
+      reset: this.windowSec,
+    };
+  }
+  getHeaders(state: { remaining: number; reset: number }) {
+    return {
+      "X-RateLimit-Remaining": String(state.remaining),
+      "X-RateLimit-Reset": String(state.reset),
+    };
+  }
+}
 
 // ===== Fireflies Client =====
 class FirefliesClient {
-  private apiKey: string;
-  private baseUrl = 'https://api.fireflies.ai/graphql';
-  private logger: Logger;
-
-  constructor(apiKey: string, logger: Logger) {
-    this.apiKey = apiKey;
-    this.logger = logger.child({ service: 'FirefliesClient' });
-  }
+  private baseUrl = "https://api.fireflies.ai/graphql";
+  constructor(private apiKey: string, private logger: Logger) {}
 
   async graphqlRequest(query: string, variables: Record<string, any> = {}) {
-    this.logger.debug('Making GraphQL request', { query, variables });
-    
-    const response = await fetch(this.baseUrl, {
-      method: 'POST',
+    this.logger.debug("fireflies gql", { variables });
+    const res = await fetch(this.baseUrl, {
+      method: "POST",
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${this.apiKey}`,
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.apiKey}`,
       },
       body: JSON.stringify({ query, variables }),
     });
-
-    if (!response.ok) {
-      const error = new Error(`Fireflies API error: ${response.status} ${response.statusText}`);
-      this.logger.error('Fireflies API request failed', error);
-      throw error;
+    if (!res.ok) {
+      const body = await res.text();
+      this.logger.error(
+        "Fireflies API error",
+        new Error(`${res.status} ${res.statusText}`),
+        { body },
+      );
+      throw new Error(`Fireflies API error: ${res.status} ${res.statusText}`);
     }
-
-    const data = await response.json<any>();
+    const data = await res.json<any>();
     if (data.errors) {
-      const error = new Error(`GraphQL errors: ${JSON.stringify(data.errors)}`);
-      this.logger.error('GraphQL query failed', error, { errors: data.errors });
-      throw error;
+      this.logger.error("Fireflies GraphQL errors", new Error("GraphQL"), {
+        errors: data.errors,
+      });
+      throw new Error(`GraphQL errors: ${JSON.stringify(data.errors)}`);
     }
-
     return data.data;
   }
 
-  async getTranscripts(limit = 25, toDate: string | null = null): Promise<FirefliesTranscript[]> {
+  async getTranscripts(
+    limit = 25,
+    toDate: string | null = null,
+  ): Promise<FirefliesTranscript[]> {
     const query = `
       query GetTranscripts($limit: Int, $toDate: DateTime) {
         transcripts(limit: $limit, toDate: $toDate) {
-          title
-          id
-          transcript_url
-          duration
-          date
-          participants
+          id title transcript_url duration date participants
+          summary { keywords action_items overview bullet_gist }
         }
       }
     `;
-
-    const variables = {
+    const data = await this.graphqlRequest(query, {
       limit: Math.min(limit, 100),
       toDate,
-    };
-
-    const data = await this.graphqlRequest(query, variables);
-    this.logger.info('Fetched transcripts', { count: data.transcripts.length });
-    return data.transcripts;
+    });
+    return data.transcripts as FirefliesTranscript[];
   }
 
-  async getTranscriptById(transcriptId: string): Promise<FirefliesTranscript> {
-    this.logger.debug('Fetching transcript', { transcriptId });
-    
+  async getTranscriptById(id: string): Promise<FirefliesTranscript> {
     const query = `
       query GetTranscriptContent($id: String!) {
         transcript(id: $id) {
-          title
-          id
-          transcript_url
-          duration
-          date
-          participants
-          sentences {
-            text
-            speaker_id
-            start_time
-          }
-          summary {
-            keywords
-            action_items
-          }
+          id title transcript_url duration date participants
+          sentences { text speaker_id start_time }
+          summary { keywords action_items overview bullet_gist }
         }
       }
     `;
-
-    const variables = { id: transcriptId };
-    const data = await this.graphqlRequest(query, variables);
-    return data.transcript;
+    const data = await this.graphqlRequest(query, { id });
+    return data.transcript as FirefliesTranscript;
   }
 
-  formatTranscriptAsMarkdown(transcript: FirefliesTranscript): string {
-    let markdown = `# ${transcript.title}\n\n`;
-    markdown += `**Date:** ${new Date(transcript.date).toLocaleString()}\n`;
-    markdown += `**Duration:** ${Math.floor(transcript.duration / 60)} minutes\n`;
-    markdown += `**Participants:** ${transcript.participants.join(', ')}\n\n`;
-
-    if (transcript.summary?.keywords?.length > 0) {
-      markdown += `## Keywords\n${transcript.summary.keywords.join(', ')}\n\n`;
+  formatTranscriptAsMarkdown(t: FirefliesTranscript): string {
+    let md = `# ${t.title}\n\n`;
+    md += `**Date:** ${new Date(t.date).toLocaleString()}\n`;
+    md += `**Duration:** ${Math.floor((t.duration || 0) / 60)} minutes\n`;
+    md += `**Participants:** ${(t.participants || []).join(", ")}\n\n`;
+    
+    if (t.summary?.overview) {
+      md += `## Summary\n${t.summary.overview}\n\n`;
     }
-
-    if (transcript.summary?.action_items && Array.isArray(transcript.summary.action_items) && transcript.summary.action_items.length > 0) {
-      markdown += `## Action Items\n`;
-      transcript.summary.action_items.forEach((item: string) => {
-        markdown += `- ${item}\n`;
-      });
-      markdown += '\n';
+    
+    if (Array.isArray(t.summary?.bullet_gist) && t.summary.bullet_gist.length) {
+      md += `## Key Points\n` + t.summary.bullet_gist.map((x) =>
+        `- ${x}`
+      ).join("\n") + "\n\n";
     }
-
-    if (transcript.sentences?.length > 0) {
-      markdown += `## Transcript\n\n`;
-      let currentSpeaker = '';
-      
-      transcript.sentences.forEach((sentence: any) => {
-        if (sentence.speaker_id !== currentSpeaker) {
-          currentSpeaker = sentence.speaker_id;
-          markdown += `\n**${currentSpeaker}:**\n`;
+    
+    if (t.summary?.keywords?.length) {
+      md += `## Keywords\n${t.summary.keywords.join(", ")}\n\n`;
+    }
+    
+    if (
+      Array.isArray(t.summary?.action_items) && t.summary!.action_items!.length
+    ) {
+      md += `## Action Items\n` + t.summary!.action_items!.map((x) =>
+        `- ${x}`
+      ).join("\n") + "\n\n";
+    }
+    
+    if (t.sentences?.length) {
+      md += `## Transcript\n\n`;
+      let cur = "";
+      for (const s of t.sentences) {
+        if (s.speaker_id !== cur) {
+          cur = s.speaker_id;
+          md += `\n**${cur}:**\n`;
         }
-        markdown += `${sentence.text} `;
-      });
+        md += `${s.text} `;
+      }
     }
-
-    return markdown;
+    return md;
   }
 
-  extractMetadata(transcript: FirefliesTranscript): TranscriptMetadata {
+  extractMetadata(t: FirefliesTranscript): TranscriptMetadata {
     return {
-      id: transcript.id,
-      title: transcript.title,
-      date: transcript.date,
-      duration: transcript.duration,
-      participants: transcript.participants,
-      speakerCount: new Set(transcript.sentences?.map((s: any) => s.speaker_id) || []).size,
-      summary: transcript.summary,
+      id: t.id,
+      title: t.title,
+      date: t.date,
+      duration: t.duration,
+      participants: t.participants || [],
+      speakerCount: new Set(t.sentences?.map((s) => s.speaker_id) || []).size,
+      summary: t.summary,
     };
   }
 }
 
-// ===== Enhanced Chunking Strategy =====
-class ChunkingStrategy {
-  private logger: Logger;
+// ===== Supabase Storage =====
+class SupabaseStorageService {
+  private bucket = "meetings";
+  constructor(private client: SupabaseClient, private logger: Logger) {}
 
-  constructor(logger: Logger) {
-    this.logger = logger.child({ service: 'ChunkingStrategy' });
-  }
-
-  chunkTranscript(transcript: FirefliesTranscript, options: ProcessingOptions = {}) {
-    const {
-      maxChunkSize = 500,
-      overlap = 50,
-      bySpeaker = true,
-    } = options;
-
-    this.logger.debug('Chunking transcript', { 
-      transcriptId: transcript.id, 
-      options 
-    });
-
-    const chunks: any[] = [];
+  async uploadTranscript(
+    transcriptId: string,
+    content: string,
+    metadata?: TranscriptMetadata,
+  ): Promise<string> {
+    // Generate filename with date - title format
+    let fileName = `transcripts/${transcriptId}.md`; // fallback
     
-    if (!transcript.sentences || transcript.sentences.length === 0) {
-      this.logger.warn('No sentences in transcript', { transcriptId: transcript.id });
-      return chunks;
-    }
-
-    if (bySpeaker) {
-      // Group sentences by speaker and detect conversation threads
-      const speakerGroups = this.groupBySpeaker(transcript.sentences);
-      const threads = this.detectConversationThreads(speakerGroups);
+    if (metadata) {
+      // Format date as YYYY-MM-DD
+      const date = new Date(metadata.date);
+      const dateStr = date.toISOString().split('T')[0];
       
-      // Create chunks from speaker groups with thread info
-      speakerGroups.forEach((group) => {
-        const text = group.sentences.map((s: any) => s.text).join(' ');
-        const words = text.split(/\s+/);
-        const thread = threads.find(t => 
-          t.startTime <= group.startTime && t.endTime >= group.endTime
-        );
-
-        for (let i = 0; i < words.length; i += maxChunkSize - overlap) {
-          const chunkWords = words.slice(i, i + maxChunkSize);
-          if (chunkWords.length > 0) {
-            chunks.push({
-              text: chunkWords.join(' '),
-              speaker: group.speaker,
-              startTime: i === 0 ? group.startTime : null,
-              endTime: i + maxChunkSize >= words.length ? group.endTime : null,
-              chunkIndex: chunks.length,
-              conversationThread: thread?.id,
-            });
-          }
-        }
-      });
-    } else {
-      // Simple text-based chunking
-      const fullText = transcript.sentences.map((s: any) => s.text).join(' ');
-      const words = fullText.split(/\s+/);
-
-      for (let i = 0; i < words.length; i += maxChunkSize - overlap) {
-        const chunkWords = words.slice(i, i + maxChunkSize);
-        if (chunkWords.length > 0) {
-          chunks.push({
-            text: chunkWords.join(' '),
-            chunkIndex: chunks.length,
-          });
-        }
-      }
+      // Clean title for filename (remove invalid characters)
+      const cleanTitle = metadata.title
+        .replace(/[^a-zA-Z0-9\s\-]/g, '') // Remove special chars except spaces and hyphens
+        .replace(/\s+/g, ' ') // Normalize spaces
+        .trim()
+        .substring(0, 100); // Limit length
+      
+      fileName = `transcripts/${dateStr} - ${cleanTitle}.md`;
     }
-
-    this.logger.info('Created chunks', { 
-      transcriptId: transcript.id, 
-      chunkCount: chunks.length 
-    });
     
-    return chunks;
-  }
-
-  private groupBySpeaker(sentences: any[]): any[] {
-    const groups: any[] = [];
-    let currentGroup: any = null;
-
-    sentences.forEach((sentence) => {
-      if (!currentGroup || currentGroup.speaker !== sentence.speaker_id) {
-        if (currentGroup) {
-          groups.push(currentGroup);
-        }
-        currentGroup = {
-          speaker: sentence.speaker_id,
-          sentences: [],
-          startTime: sentence.start_time,
-          endTime: sentence.start_time,
-        };
-      }
-      currentGroup.sentences.push(sentence);
-      currentGroup.endTime = sentence.start_time;
-    });
-
-    if (currentGroup) {
-      groups.push(currentGroup);
+    this.logger.debug("upload storage", { fileName });
+    const { error } = await this.client.storage.from(this.bucket).upload(
+      fileName,
+      content,
+      { contentType: "text/markdown", upsert: true },
+    );
+    if (error) {
+      this.logger.error("storage upload failed", new Error(error.message));
+      throw new Error(`Storage upload failed: ${error.message}`);
     }
-
-    return groups;
-  }
-
-  private detectConversationThreads(speakerGroups: any[]): ConversationThread[] {
-    const threads: ConversationThread[] = [];
-    let currentThread: ConversationThread | null = null;
-    const threadGapThreshold = 30; // 30 seconds gap means new thread
-
-    speakerGroups.forEach((group, index) => {
-      const previousGroup = index > 0 ? speakerGroups[index - 1] : null;
-      
-      if (!previousGroup || 
-          group.startTime - previousGroup.endTime > threadGapThreshold) {
-        // Start new thread
-        if (currentThread) {
-          threads.push(currentThread);
-        }
-        currentThread = {
-          id: `thread-${threads.length + 1}`,
-          topic: '', // Would need NLP to extract topic
-          chunks: [],
-          participants: [group.speaker],
-          startTime: group.startTime,
-          endTime: group.endTime,
-        };
-      } else if (currentThread) {
-        // Continue thread
-        currentThread.endTime = group.endTime;
-        if (!currentThread.participants.includes(group.speaker)) {
-          currentThread.participants.push(group.speaker);
-        }
-      }
-    });
-
-    if (currentThread) {
-      threads.push(currentThread);
-    }
-
-    return threads;
+    const { data } = this.client.storage.from(this.bucket).getPublicUrl(
+      fileName,
+    );
+    return data.publicUrl;
   }
 }
 
-// ===== Enhanced Vectorization Service =====
-class VectorizationService {
-  private cache: CacheService;
-  private logger: Logger;
-
-  constructor(private ai: Ai, cache: CacheService, logger: Logger) {
-    this.cache = cache;
-    this.logger = logger.child({ service: 'VectorizationService' });
-  }
-
-  async generateEmbedding(text: string): Promise<number[]> {
-    // Check cache first
-    const cached = await this.cache.getEmbedding(text);
-    if (cached) {
-      this.logger.debug('Using cached embedding');
-      return cached;
-    }
-
-    this.logger.debug('Generating new embedding');
-    const response = await this.ai.run('@cf/baai/bge-base-en-v1.5', {
-      text,
-    });
-
-    const embedding = (response as any).data[0];
-    
-    // Cache the embedding
-    await this.cache.setEmbedding(text, embedding);
-    
-    return embedding;
-  }
-
-  async generateEmbeddings(texts: string[]): Promise<number[][]> {
-    this.logger.debug('Generating embeddings batch', { count: texts.length });
-    
-    // Process in batches to avoid overwhelming the API
-    const batchSize = 10;
-    const embeddings: number[][] = [];
-    
-    for (let i = 0; i < texts.length; i += batchSize) {
-      const batch = texts.slice(i, i + batchSize);
-      const batchEmbeddings = await Promise.all(
-        batch.map(text => this.generateEmbedding(text))
-      );
-      embeddings.push(...batchEmbeddings);
-      
-      // Add small delay between batches
-      if (i + batchSize < texts.length) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-    }
-    
-    return embeddings;
-  }
-}
-
-// ===== Enhanced Database Service =====
+// ===== Database (direct SQL) =====
 class DatabaseService {
   private sql: ReturnType<typeof postgres>;
-  private logger: Logger;
-
-  constructor(connectionString: string, logger: Logger) {
-    this.sql = postgres(connectionString, {
-      max: 5,
-      fetch_types: false,
-    });
-    this.logger = logger.child({ service: 'DatabaseService' });
+  constructor(conn: string, private logger: Logger) {
+    this.sql = postgres(conn, { max: 5, fetch_types: false });
   }
 
-  async saveMeeting(metadata: TranscriptMetadata, fileUrl: string): Promise<void> {
-    this.logger.debug('Saving meeting', { meetingId: metadata.id });
+  /** Upsert document (formerly meeting) and RETURN id (uuid/text) */
+  async saveMeeting(
+    meta: TranscriptMetadata,
+    fileUrl: string,
+  ): Promise<string> {
+    this.logger.debug("save document", { fireflies_id: meta.id });
     
-    // Map to existing database schema
-    const summary = metadata.summary ? {
-      keywords: metadata.summary.keywords || [],
-      action_items: metadata.summary.action_items || []
-    } : {};
+    // Generate the Fireflies link
+    const firefliesLink = `https://app.fireflies.ai/view/${meta.id}`;
     
-    await this.sql`
-      INSERT INTO meetings (
-        id, transcript_id, title, date, duration_minutes, participants, speaker_count,
-        category, tags, summary, transcript_url, storage_bucket_path,
-        created_at, updated_at
-      ) VALUES (
-        ${metadata.id}, ${metadata.id}, ${metadata.title}, ${metadata.date}, 
-        ${Math.round((metadata.duration || 0) / 60)}, ${metadata.participants}, 
-        ${metadata.speakerCount}, ${metadata.meetingType || 'general'}, 
-        ${metadata.summary?.keywords || []}, ${JSON.stringify(summary)}, 
-        ${fileUrl}, ${fileUrl}, NOW(), NOW()
-      )
-      ON CONFLICT (id) DO UPDATE SET
-        title = EXCLUDED.title,
-        date = EXCLUDED.date,
-        duration_minutes = EXCLUDED.duration_minutes,
-        participants = EXCLUDED.participants,
-        speaker_count = EXCLUDED.speaker_count,
-        category = EXCLUDED.category,
-        tags = EXCLUDED.tags,
-        summary = EXCLUDED.summary,
-        transcript_url = EXCLUDED.transcript_url,
-        storage_bucket_path = EXCLUDED.storage_bucket_path,
-        updated_at = NOW()
-    `;
+    // Format the full markdown content (will be stored in content column)
+    const fireflies = new FirefliesClient("", this.logger); // Temporary instance for formatting
+    const mockTranscript: FirefliesTranscript = {
+      id: meta.id,
+      title: meta.title,
+      date: meta.date,
+      duration: meta.duration,
+      participants: meta.participants,
+      summary: meta.summary,
+    };
+    const markdownContent = fireflies.formatTranscriptAsMarkdown(mockTranscript);
     
-    this.logger.info('Meeting saved', { meetingId: metadata.id });
-  }
-
-  async saveChunks(transcriptId: string, chunks: TranscriptChunk[]): Promise<void> {
-    this.logger.debug('Saving chunks', { 
-      transcriptId, 
-      chunkCount: chunks.length 
-    });
-    
-    // Delete existing chunks for this transcript (using meeting_id as that's what exists)
-    await this.sql`DELETE FROM meeting_chunks WHERE meeting_id = ${transcriptId}`;
-
-    // Insert new chunks with embeddings - map to existing schema
-    for (const chunk of chunks) {
-      const metadata = {
-        conversation_thread: chunk.conversation_thread
-      };
-      
-      const speakerInfo = chunk.speaker ? {
-        name: chunk.speaker,
-        start_time: chunk.start_time,
-        end_time: chunk.end_time
-      } : null;
-      
-      await this.sql`
-        INSERT INTO meeting_chunks (
-          meeting_id, chunk_index, content, speaker_info,
-          start_timestamp, end_timestamp, embedding, metadata, 
-          chunk_type, search_text, created_at
-        ) VALUES (
-          ${chunk.transcript_id}, ${chunk.chunk_index}, ${chunk.text},
-          ${JSON.stringify(speakerInfo)}, ${chunk.start_time}, ${chunk.end_time},
-          ${JSON.stringify(chunk.embedding)}, ${JSON.stringify(metadata)}, 
-          'transcript', ${chunk.text}, NOW()
-        )
-      `;
+    // Handle participants array properly
+    let participantsArray: string[] = [];
+    if (meta.participants) {
+      if (Array.isArray(meta.participants)) {
+        participantsArray = meta.participants;
+      } else if (typeof meta.participants === 'string') {
+        // If it's a comma-separated string, split it
+        participantsArray = (meta.participants as any).split(',').map((p: string) => p.trim());
+      }
     }
     
-    this.logger.info('Chunks saved', { 
-      transcriptId, 
-      chunkCount: chunks.length 
-    });
+    // Format action_items array
+    const actionItemsArray = Array.isArray(meta.summary?.action_items) 
+      ? meta.summary.action_items 
+      : [];
+    
+    // Format bullet_points array  
+    const bulletPointsArray = Array.isArray(meta.summary?.bullet_gist)
+      ? meta.summary.bullet_gist
+      : [];
+    
+    // Use COALESCE to handle empty arrays gracefully - escape JSON properly for SQL
+    const participantsSql = participantsArray.length > 0 
+      ? `(SELECT array_agg(value) FROM jsonb_array_elements_text('${JSON.stringify(participantsArray).replace(/'/g, "''")}'::jsonb))`
+      : `'{}'::text[]`;
+    
+    const actionItemsSql = actionItemsArray.length > 0
+      ? `(SELECT array_agg(value) FROM jsonb_array_elements_text('${JSON.stringify(actionItemsArray.map(String)).replace(/'/g, "''")}'::jsonb))`
+      : `'{}'::text[]`;
+    
+    const bulletPointsSql = bulletPointsArray.length > 0
+      ? `(SELECT array_agg(value) FROM jsonb_array_elements_text('${JSON.stringify(bulletPointsArray.map(String)).replace(/'/g, "''")}'::jsonb))`
+      : `'{}'::text[]`;
+    
+    const rows = await this.sql`
+      INSERT INTO documents (
+        title, 
+        source, 
+        content,
+        category,
+        participants,
+        summary,
+        action_items,
+        bullet_points,
+        fireflies_id,
+        fireflies_link,
+        date,
+        metadata,
+        created_at,
+        updated_at
+      ) VALUES (
+        ${meta.title},
+        ${'fireflies'},
+        ${markdownContent},
+        ${'meeting'},
+        ${this.sql.unsafe(participantsSql)},
+        ${meta.summary?.overview || ''},
+        ${this.sql.unsafe(actionItemsSql)},
+        ${this.sql.unsafe(bulletPointsSql)},
+        ${meta.id},
+        ${firefliesLink},
+        ${new Date(meta.date)},
+        ${JSON.stringify({ 
+          fireflies_id: meta.id, 
+          source: 'fireflies',
+          speaker_count: meta.speakerCount || 0,
+          meeting_date: meta.date,
+          duration_minutes: Math.round((meta.duration || 0) / 60),
+          storage_bucket_path: fileUrl,
+          keywords: Array.isArray(meta.summary?.keywords) ? meta.summary.keywords : [],
+          status: 'pending',
+          raw_summary: meta.summary
+        })},
+        NOW(),
+        NOW()
+      )
+      ON CONFLICT (fireflies_id) DO UPDATE SET
+        title = EXCLUDED.title,
+        content = EXCLUDED.content,
+        participants = EXCLUDED.participants,
+        summary = EXCLUDED.summary,
+        action_items = EXCLUDED.action_items,
+        bullet_points = EXCLUDED.bullet_points,
+        date = EXCLUDED.date,
+        metadata = EXCLUDED.metadata,
+        updated_at = NOW()
+      RETURNING id
+    `;
+    const documentId = rows[0]?.id as string;
+    if (!documentId) throw new Error("Failed to upsert document");
+    return documentId;
   }
 
   async vectorSearch(
     queryEmbedding: number[],
-    options: SearchOptions = {}
+    options: SearchOptions = {},
   ): Promise<VectorSearchResult[]> {
-    const {
-      limit = 10,
-      threshold = 0.7,
-      filters = {},
-    } = options;
-
-    this.logger.debug('Performing vector search', { options });
-
-    // Build dynamic WHERE clause
-    const conditions = [`1 - (c.embedding <=> ${JSON.stringify(queryEmbedding)}::vector) > ${threshold}`];
-    
+    const { limit = 10, threshold = 0.7, filters = {}, includeHighlights } =
+      options;
+    // pgvector cosine distance via <=> (assuming embeddings are normalized). Similarity = 1 - distance
+    const conds: string[] = [
+      `1 - (c.embedding <=> ${
+        JSON.stringify(queryEmbedding)
+      }::vector) > ${threshold}`,
+    ];
     if (filters.department) {
-      conditions.push(`m.department = ${filters.department}`);
+      conds.push(
+        `d.metadata->>'department' = ${
+          postgres.unsafeLiteral(`'${filters.department.replace(/'/g, "''")}'`)
+        }`,
+      );
     }
     if (filters.project) {
-      conditions.push(`m.project = ${filters.project}`);
+      conds.push(
+        `d.project_id::text = ${
+          postgres.unsafeLiteral(`'${filters.project.replace(/'/g, "''")}'`)
+        }`,
+      );
     }
     if (filters.dateFrom) {
-      conditions.push(`m.date >= ${filters.dateFrom}`);
+      conds.push(
+        `d.meeting_date >= ${postgres.unsafeLiteral(`'${filters.dateFrom}'`)}`,
+      );
     }
     if (filters.dateTo) {
-      conditions.push(`m.date <= ${filters.dateTo}`);
+      conds.push(`d.meeting_date <= ${postgres.unsafeLiteral(`'${filters.dateTo}'`)}`);
     }
+    const whereClause = conds.join(" AND ");
 
-    const whereClause = conditions.join(' AND ');
-
-    const results = await this.sql`
+    const rows = await this.sql`
       SELECT 
-        c.*,
-        m.title, m.date, m.duration_minutes, m.participants,
-        m.speaker_count, m.category, m.tags, m.summary,
-        1 - (c.embedding <=> ${JSON.stringify(queryEmbedding)}::vector) as similarity
-      FROM meeting_chunks c
-      JOIN meetings m ON c.meeting_id = m.id
+        c.document_id, c.chunk_index, c.content as text, c.metadata as chunk_metadata,
+        d.title, d.metadata->>'meeting_date' as meeting_date, (d.metadata->>'duration_minutes')::int as duration_minutes, d.participants, 
+        d.category, d.summary, d.action_items, d.bullet_points,
+        1 - (c.embedding <=> ${
+      JSON.stringify(queryEmbedding)
+    }::vector) as similarity
+      FROM document_chunks c
+      JOIN documents d ON c.document_id = d.id
       WHERE ${this.sql.unsafe(whereClause)}
       ORDER BY similarity DESC
       LIMIT ${limit}
     `;
 
-    this.logger.info('Vector search completed', { 
-      resultCount: results.length 
-    });
-
-    return results.map((row: any) => ({
+    return rows.map((r: any) => ({
       chunk: {
-        transcript_id: row.transcript_id,
-        chunk_index: row.chunk_index,
-        text: row.text,
-        speaker: row.speaker,
-        start_time: row.start_time,
-        end_time: row.end_time,
-        embedding: row.embedding,
-        conversation_thread: row.conversation_thread,
+        document_id: r.document_id,
+        chunk_index: r.chunk_index,
+        text: r.text,
+        metadata: r.chunk_metadata,
+        embedding: r.embedding,
       },
-      similarity: row.similarity,
+      similarity: Number(r.similarity),
       metadata: {
-        id: row.transcript_id,
-        title: row.title,
-        date: row.date,
-        duration: row.duration,
-        participants: row.participants,
-        speakerCount: row.speaker_count,
-        meetingType: row.meeting_type,
-        department: row.department,
-        project: row.project,
-        summary: {
-          keywords: row.keywords,
-          action_items: row.action_items,
-        },
+        title: r.title,
+        date: r.meeting_date,
+        duration_minutes: r.duration_minutes,
+        participants: r.participants,
+        category: r.category,
+        summary: r.summary,
+        action_items: r.action_items,
+        bullet_points: r.bullet_points,
       },
-      highlight: options.includeHighlights ? this.generateHighlight(row.text, queryEmbedding.toString()) : undefined,
+      highlight: includeHighlights ? this.generateHighlight(r.text) : undefined,
     }));
   }
 
-  private generateHighlight(text: string, query: string): string {
-    // Simple highlight generation - in production, use more sophisticated NLP
-    const words = text.split(/\s+/);
-    const excerpt = words.slice(0, 30).join(' ');
-    return excerpt + (words.length > 30 ? '...' : '');
+  private generateHighlight(text: string) {
+    return (text || "").split(/\s+/).slice(0, 30).join(" ") +
+      ((text || "").split(/\s+/).length > 30 ? "…" : "");
   }
 
-  async getAnalytics(): Promise<AnalyticsData> {
-    this.logger.debug('Generating analytics');
-
+  async analytics(): Promise<AnalyticsData> {
     const [
-      totalMeetings,
-      totalChunks,
-      durationStats,
-      topSpeakers,
-      topKeywords,
-      departmentBreakdown,
-      projectBreakdown,
-      meetingTypeBreakdown,
-      lastWeekMeetings,
-      lastMonthMeetings,
-      lastSyncInfo,
+      tm,
+      tc,
+      dur,
+      topSpk,
+      topKw,
+      dept,
+      proj,
+      mtype,
+      lastW,
+      lastM,
+      lastSync,
     ] = await Promise.all([
-      this.sql`SELECT COUNT(*) as count FROM meetings`,
-      this.sql`SELECT COUNT(*) as count FROM meeting_chunks`,
-      this.sql`SELECT SUM(duration) as total, AVG(duration) as average FROM meetings`,
-      this.sql`
-        SELECT unnest(participants) as name, COUNT(*) as count
-        FROM meetings
-        GROUP BY name
-        ORDER BY count DESC
-        LIMIT 10
-      `,
-      this.sql`
-        SELECT unnest(keywords) as keyword, COUNT(*) as frequency
-        FROM meetings
-        WHERE keywords IS NOT NULL
-        GROUP BY keyword
-        ORDER BY frequency DESC
-        LIMIT 20
-      `,
-      this.sql`
-        SELECT department, COUNT(*) as count
-        FROM meetings
-        WHERE department IS NOT NULL
-        GROUP BY department
-        ORDER BY count DESC
-      `,
-      this.sql`
-        SELECT project, COUNT(*) as count
-        FROM meetings
-        WHERE project IS NOT NULL
-        GROUP BY project
-        ORDER BY count DESC
-      `,
-      this.sql`
-        SELECT meeting_type, COUNT(*) as count
-        FROM meetings
-        WHERE meeting_type IS NOT NULL
-        GROUP BY meeting_type
-        ORDER BY count DESC
-      `,
-      this.sql`
-        SELECT COUNT(*) as count
-        FROM meetings
-        WHERE date >= CURRENT_DATE - INTERVAL '7 days'
-      `,
-      this.sql`
-        SELECT COUNT(*) as count
-        FROM meetings
-        WHERE date >= CURRENT_DATE - INTERVAL '30 days'
-      `,
-      this.sql`
-        SELECT 
-          MAX(created_at) as last_sync,
-          COUNT(CASE WHEN created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours' THEN 1 END) as last_day_count
-        FROM meetings
-      `,
+      this.sql`SELECT COUNT(*)::int as count FROM documents WHERE source = 'fireflies'`,
+      this.sql`SELECT COUNT(*)::int as count FROM document_chunks WHERE document_id IN (SELECT id FROM documents WHERE source = 'fireflies')`,
+      this
+        .sql`SELECT COALESCE(SUM(duration_minutes),0)::int as total_min, COALESCE(AVG(duration_minutes),0)::int as avg_min FROM documents WHERE source = 'fireflies'`,
+      this
+        .sql`SELECT unnest(participants) as name, COUNT(*)::int as count FROM documents WHERE source = 'fireflies' GROUP BY name ORDER BY count DESC LIMIT 10`,
+      this
+        .sql`SELECT metadata->>'keywords' as keywords FROM documents WHERE source = 'fireflies' AND metadata->>'keywords' IS NOT NULL`,
+      this
+        .sql`SELECT metadata->>'department' as department, COUNT(*)::int as count FROM documents WHERE source = 'fireflies' AND metadata->>'department' IS NOT NULL GROUP BY department ORDER BY count DESC`,
+      this
+        .sql`SELECT p.name as project, COUNT(*)::int as count FROM documents d LEFT JOIN projects p ON d.project_id = p.id WHERE d.source = 'fireflies' AND d.project_id IS NOT NULL GROUP BY p.name ORDER BY count DESC`,
+      this
+        .sql`SELECT metadata->>'meeting_type' as meeting_type, COUNT(*)::int as count FROM documents WHERE source = 'fireflies' AND metadata->>'meeting_type' IS NOT NULL GROUP BY meeting_type ORDER BY count DESC`,
+      this
+        .sql`SELECT COUNT(*)::int as count FROM documents WHERE source = 'fireflies' AND meeting_date >= CURRENT_DATE - INTERVAL '7 days'`,
+      this
+        .sql`SELECT COUNT(*)::int as count FROM documents WHERE source = 'fireflies' AND meeting_date >= CURRENT_DATE - INTERVAL '30 days'`,
+      this
+        .sql`SELECT MAX(updated_at) as last_sync, COUNT(CASE WHEN created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours' THEN 1 END)::int as last_day_count FROM documents WHERE source = 'fireflies'`,
     ]);
 
-    const totalMeetingCount = totalMeetings[0]?.count || 0;
-    const totalChunkCount = totalChunks[0]?.count || 0;
-    const averageChunksPerMeeting = totalMeetingCount > 0 ? 
-      Math.round(totalChunkCount / totalMeetingCount) : 0;
+    const totalMeetings = tm[0]?.count || 0;
+    const totalChunks = tc[0]?.count || 0;
+    const avgChunks = totalMeetings
+      ? Math.round(totalChunks / totalMeetings)
+      : 0;
 
-    // Convert department breakdown to object
+    // Flatten keywords (now they're directly arrays in documents table)
+    const keywordFreq: Record<string, number> = {};
+    for (const row of topKw as any[]) {
+      const arr: string[] = JSON.parse(row.keywords || '[]');
+      for (const k of arr) {
+        if (typeof k === "string") {
+          keywordFreq[k] = (keywordFreq[k] || 0) + 1;
+        }
+      }
+    }
+    const topKeywords = Object.entries(keywordFreq).sort((a, b) => b[1] - a[1])
+      .slice(0, 20).map(([keyword, frequency]) => ({ keyword, frequency }));
+
     const deptObj: Record<string, number> = {};
-    for (const dept of (departmentBreakdown || [])) {
-      if (dept.department) deptObj[dept.department] = dept.count;
+    for (const d of (dept as any[])) {
+      if (d.department) deptObj[d.department] = d.count;
     }
-
-    // Convert meeting type breakdown to object
     const typeObj: Record<string, number> = {};
-    for (const type of (meetingTypeBreakdown || [])) {
-      if (type.meeting_type) typeObj[type.meeting_type] = type.count;
+    for (const t of (mtype as any[])) {
+      if (t.meeting_type) typeObj[t.meeting_type] = t.count;
     }
 
-    // Estimate storage size (rough calculation)
-    const estimatedStorageMB = Math.round(
-      (totalChunkCount * 1000 + totalMeetingCount * 50000) / (1024 * 1024)
+    const estMB = Math.round(
+      (totalChunks * 1000 + totalMeetings * 50000) / (1024 * 1024),
     );
 
     return {
       meetings: {
-        total: totalMeetingCount,
-        lastWeek: lastWeekMeetings[0]?.count || 0,
-        lastMonth: lastMonthMeetings[0]?.count || 0,
+        total: totalMeetings,
+        lastWeek: lastW[0]?.count || 0,
+        lastMonth: lastM[0]?.count || 0,
         byDepartment: deptObj,
         byMeetingType: typeObj,
       },
       chunks: {
-        total: totalChunkCount,
-        averagePerMeeting: averageChunksPerMeeting,
-        withSpeaker: totalChunkCount,
-        withThread: Math.round(totalChunkCount * 0.6),
+        total: totalChunks,
+        averagePerMeeting: avgChunks,
+        withSpeaker: totalChunks,
+        withThread: Math.round(totalChunks * 0.6),
       },
       storage: {
-        filesCount: totalMeetingCount,
-        totalSize: `${estimatedStorageMB} MB`,
-        averageFileSize: `${totalMeetingCount > 0 ? (estimatedStorageMB / totalMeetingCount).toFixed(2) : 0} MB`,
+        filesCount: totalMeetings,
+        totalSize: `${estMB} MB`,
+        averageFileSize: `${
+          totalMeetings ? (estMB / totalMeetings).toFixed(2) : 0
+        } MB`,
       },
       processing: {
-        lastSync: lastSyncInfo[0]?.last_sync || null,
+        lastSync: lastSync[0]?.last_sync || null,
         lastSyncDuration: 0,
-        lastSyncProcessed: lastSyncInfo[0]?.last_day_count || 0,
+        lastSyncProcessed: lastSync[0]?.last_day_count || 0,
         lastSyncFailed: 0,
         averageProcessingTime: 2000,
       },
-      search: {
-        totalSearches: 0,
-        averageResponseTime: 150,
-        cacheHitRate: 0.7,
-      },
-      system: {
-        version: '2.0.0',
-        uptime: Date.now(),
-        kvCacheEntries: 0,
-      },
-      // Legacy fields for backward compatibility
-      totalMeetings: totalMeetingCount,
-      totalDuration: durationStats[0]?.total || 0,
-      averageDuration: durationStats[0]?.average || 0,
-      topSpeakers: topSpeakers.map((r: any) => ({ name: r.name, count: r.count })),
-      topKeywords: topKeywords.map((r: any) => ({ keyword: r.keyword, frequency: r.frequency })),
-      departmentBreakdown: departmentBreakdown.map((r: any) => ({ department: r.department, count: r.count })),
-      projectBreakdown: projectBreakdown.map((r: any) => ({ project: r.project, count: r.count })),
-      sentimentAnalysis: {
-        positive: 0,
-        neutral: 0,
-        negative: 0,
-      },
+      search: { totalSearches: 0, averageResponseTime: 150, cacheHitRate: 0.7 },
+      totalMeetings,
+      totalDuration: dur[0]?.total_min || 0,
+      averageDuration: dur[0]?.avg_min || 0,
+      topSpeakers: (topSpk as any[]).map((r) => ({
+        name: r.name,
+        count: r.count,
+      })),
+      topKeywords,
+      departmentBreakdown: dept as any,
+      projectBreakdown: proj as any,
+      sentimentAnalysis: { positive: 0, neutral: 0, negative: 0 },
     };
   }
 
-  async cleanup(): Promise<void> {
+  async cleanup() {
     await this.sql.end();
   }
 }
 
-// ===== Supabase Storage Service =====
-class SupabaseStorageService {
-  private client: SupabaseClient;
-  private bucketName = 'meetings';
-  private logger: Logger;
+// ===== Webhook HMAC =====
+class WebhookHandler {
+  constructor(private secret: string | undefined, private logger: Logger) {}
 
-  constructor(client: SupabaseClient, logger: Logger) {
-    this.client = client;
-    this.logger = logger.child({ service: 'SupabaseStorage' });
-  }
-
-  async uploadTranscript(transcriptId: string, content: string): Promise<string> {
-    const fileName = `transcripts/${transcriptId}.md`;
-    
-    this.logger.debug('Uploading transcript', { transcriptId, fileName });
-    
-    const { error } = await this.client.storage
-      .from(this.bucketName)
-      .upload(fileName, content, {
-        contentType: 'text/markdown',
-        upsert: true,
-      });
-
-    if (error) {
-      this.logger.error('Failed to upload transcript', error);
-      throw new Error(`Failed to upload transcript: ${error.message}`);
+  async verifySignature(req: Request): Promise<WebhookVerification> {
+    if (!this.secret) return { isValid: true };
+    const signature = req.headers.get("X-Fireflies-Signature");
+    const timestamp = req.headers.get("X-Fireflies-Timestamp");
+    if (!signature || !timestamp) {
+      this.logger.warn("missing webhook headers");
+      return { isValid: false };
     }
-
-    // Return public URL
-    const { data } = this.client.storage
-      .from(this.bucketName)
-      .getPublicUrl(fileName);
-
-    this.logger.info('Transcript uploaded', { transcriptId, url: data.publicUrl });
-    return data.publicUrl;
-  }
-
-  async getTranscript(transcriptId: string): Promise<string | null> {
-    const fileName = `transcripts/${transcriptId}.md`;
-    
-    const { data, error } = await this.client.storage
-      .from(this.bucketName)
-      .download(fileName);
-
-    if (error) {
-      this.logger.error('Failed to download transcript', error);
-      return null;
-    }
-
-    return await data.text();
+    const body = await req.text();
+    const message = `${timestamp}.${body}`;
+    const enc = new TextEncoder();
+    const key = await crypto.subtle.importKey(
+      "raw",
+      enc.encode(this.secret),
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    const sigBuf = await crypto.subtle.sign("HMAC", key, enc.encode(message));
+    const expected = btoa(String.fromCharCode(...new Uint8Array(sigBuf)));
+    return { isValid: signature === expected, signature, timestamp };
   }
 }
 
-// ===== Enhanced Transcript Processor =====
+// ===== Transcript Processor (no local embeddings; delegates) =====
 class TranscriptProcessor {
-  private firefliesClient: FirefliesClient;
-  private chunkingStrategy: ChunkingStrategy;
-  private vectorizationService: VectorizationService;
-  private storageService: SupabaseStorageService;
-  private databaseService: DatabaseService;
+  private supabase: SupabaseClient;
+  private storage: SupabaseStorageService;
+  private db: DatabaseService;
   private cache: CacheService;
-  private logger: Logger;
+  private fireflies: FirefliesClient;
 
-  constructor(env: Env) {
-    this.logger = new Logger('info');
-    this.cache = new CacheService(env.CACHE, env.VECTOR_CACHE_TTL);
-    
-    // Initialize Supabase client
-    const supabaseClient = createClient(
-      env.SUPABASE_URL,
-      env.SUPABASE_SERVICE_KEY
+  constructor(private env: Env, private logger = new Logger("info")) {
+    this.cache = new CacheService(env.CACHE, 3600);
+    this.supabase = createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_KEY);
+    this.storage = new SupabaseStorageService(
+      this.supabase,
+      this.logger.child({ svc: "storage" }),
     );
-
-    // Initialize services
-    this.firefliesClient = new FirefliesClient(env.FIREFLIES_API_KEY, this.logger);
-    this.chunkingStrategy = new ChunkingStrategy(this.logger);
-    this.vectorizationService = new VectorizationService(env.AI, this.cache, this.logger);
-    this.storageService = new SupabaseStorageService(supabaseClient, this.logger);
-    // Use DATABASE_URL directly if available, otherwise fall back to Hyperdrive
-    const dbUrl = env.DATABASE_URL || env.HYPERDRIVE.connectionString;
-    this.databaseService = new DatabaseService(dbUrl, this.logger);
+    const dbUrl = env.DATABASE_URL || env.HYPERDRIVE?.connectionString;
+    if (!dbUrl) {
+      throw new Error(
+        "DATABASE_URL or HYPERDRIVE.connectionString is required",
+      );
+    }
+    this.db = new DatabaseService(dbUrl, this.logger.child({ svc: "db" }));
+    this.fireflies = new FirefliesClient(
+      env.FIREFLIES_API_KEY,
+      this.logger.child({ svc: "fireflies" }),
+    );
   }
 
   async processTranscript(
-    transcriptId: string, 
-    options: ProcessingOptions = {}
+    transcriptId: string,
+    options: ProcessingOptions = {},
   ): Promise<void> {
-    const processLogger = this.logger.child({ transcriptId });
-    
-    try {
-      processLogger.info('Processing transcript');
-
-      // 1. Check if already processed recently
-      const cached = await this.cache.get('processed', transcriptId);
-      if (cached) {
-        processLogger.info('Transcript recently processed, skipping');
-        return;
-      }
-
-      // 2. Fetch transcript from Fireflies
-      const transcript = await this.firefliesClient.getTranscriptById(transcriptId);
-      if (!transcript) {
-        throw new Error(`Transcript ${transcriptId} not found`);
-      }
-
-      // 3. Format and extract metadata
-      const markdown = this.firefliesClient.formatTranscriptAsMarkdown(transcript);
-      const metadata = this.firefliesClient.extractMetadata(transcript);
-
-      // 4. Enrich metadata if requested
-      if (options.detectSentiment) {
-        // Would need sentiment analysis here
-        metadata.sentiment = 'neutral';
-      }
-
-      // 5. Upload to Supabase Storage
-      const fileUrl = await this.storageService.uploadTranscript(transcriptId, markdown);
-
-      // 6. Save meeting metadata
-      await this.databaseService.saveMeeting(metadata, fileUrl);
-
-      // 7. Chunk the transcript
-      const chunks = this.chunkingStrategy.chunkTranscript(transcript, options);
-
-      // 8. Generate embeddings
-      const chunkTexts = chunks.map(c => c.text);
-      const embeddings = await this.vectorizationService.generateEmbeddings(chunkTexts);
-
-      // 9. Prepare chunks with embeddings
-      const chunksWithEmbeddings: TranscriptChunk[] = chunks.map((chunk, index) => ({
-        transcript_id: transcriptId,
-        chunk_index: chunk.chunkIndex,
-        text: chunk.text,
-        speaker: chunk.speaker,
-        start_time: chunk.startTime,
-        end_time: chunk.endTime,
-        embedding: embeddings[index],
-        conversation_thread: chunk.conversationThread,
-      }));
-
-      // 10. Save chunks
-      await this.databaseService.saveChunks(transcriptId, chunksWithEmbeddings);
-
-      // 11. Mark as processed in cache
-      await this.cache.set('processed', transcriptId, true, 3600);
-
-      processLogger.info('Successfully processed transcript');
-    } catch (error) {
-      processLogger.error('Error processing transcript', error as Error);
-      throw error;
+    const log = this.logger.child({ transcriptId });
+    // idempotency: skip if processed flag recently set
+    const processedFlag = await this.cache.get("processed", transcriptId);
+    if (processedFlag) {
+      log.info("recently processed; skip");
+      return;
     }
-  }
 
-  async search(query: string, options: SearchOptions = {}): Promise<VectorSearchResult[]> {
-    this.logger.info('Performing search', { query, options });
-    
-    // Generate embedding for the query
-    const queryEmbedding = await this.vectorizationService.generateEmbedding(query);
-    
-    // Perform vector search
-    return await this.databaseService.vectorSearch(queryEmbedding, options);
+    const t = await this.fireflies.getTranscriptById(transcriptId);
+    if (!t) throw new Error(`Transcript not found: ${transcriptId}`);
+
+    const md = this.fireflies.formatTranscriptAsMarkdown(t);
+    const meta = this.fireflies.extractMetadata(t);
+
+    const fileUrl = await this.storage.uploadTranscript(transcriptId, md, meta);
+    const documentId = await this.db.saveMeeting(meta, fileUrl);
+
+    await this.triggerVectorization(documentId);
+
+    await this.cache.set("processed", transcriptId, true, 3600);
+    log.info("ingest complete; dispatched vectorization", { documentId });
   }
 
   async syncAllTranscripts(limit?: number): Promise<SyncResult> {
-    const batchSize = limit || 25;
-    this.logger.info('Starting sync', { batchSize });
-    
-    const result: SyncResult = {
+    const batchSize = limit || this.env.SYNC_BATCH_SIZE || 25;
+    const list = await this.fireflies.getTranscripts(batchSize);
+    const res: SyncResult = {
       success: true,
       processed: 0,
       failed: 0,
       errors: [],
     };
-
-    try {
-      const transcripts = await this.firefliesClient.getTranscripts(batchSize);
-      
-      // Process in parallel batches
-      const parallelBatch = 3;
-      for (let i = 0; i < transcripts.length; i += parallelBatch) {
-        const batch = transcripts.slice(i, i + parallelBatch);
-        
-        await Promise.all(
-          batch.map(async (transcript) => {
-            try {
-              await this.processTranscript(transcript.id);
-              result.processed++;
-            } catch (error) {
-              result.failed++;
-              result.errors?.push({
-                transcript_id: transcript.id,
-                error: (error as Error).message,
-              });
-            }
-          })
-        );
-        
-        // Add delay between batches
-        if (i + parallelBatch < transcripts.length) {
-          await new Promise(resolve => setTimeout(resolve, 500));
+    const parallel = 3;
+    for (let i = 0; i < list.length; i += parallel) {
+      const slice = list.slice(i, i + parallel);
+      await Promise.all(slice.map(async (tr) => {
+        try {
+          await this.processTranscript(tr.id);
+          res.processed++;
+        } catch (e: any) {
+          res.failed++;
+          res.errors!.push({
+            transcript_id: tr.id,
+            error: e?.message || String(e),
+          });
         }
+      }));
+      if (i + parallel < list.length) {
+        await new Promise((r) => setTimeout(r, 300));
       }
-
-      this.logger.info('Sync completed', result);
-    } catch (error) {
-      this.logger.error('Sync failed', error as Error);
-      result.success = false;
     }
-
-    return result;
+    return res;
   }
 
-  async getAnalytics(): Promise<AnalyticsData> {
-    return await this.databaseService.getAnalytics();
+  async search(
+    query: string,
+    options: SearchOptions = {},
+  ): Promise<VectorSearchResult[]> {
+    // Delegated embedding happens in vectorizer; but for searching we only need query embedding.
+    // If you want to keep query embedding also in the vectorizer, expose a /embed endpoint there and call it here.
+    // For now, assume the vectorizer exposes /embed to turn text into embedding.
+    const res = await fetch(`${this.env.VECTORIZE_WORKER_URL}/embed`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.env.WORKER_AUTH_TOKEN}`,
+      },
+      body: JSON.stringify({ text: query }),
+    });
+    if (!res.ok) throw new Error(`Vectorizer /embed failed: ${res.status}`);
+    const { embedding } = await res.json<{ embedding: number[] }>();
+    return this.db.vectorSearch(embedding, options);
   }
 
-  async cleanup(): Promise<void> {
-    await this.databaseService.cleanup();
+  async analytics(): Promise<AnalyticsData> {
+    return this.db.analytics();
+  }
+
+  async cleanup() {
+    await this.db.cleanup();
+  }
+
+  private async triggerVectorization(documentId: string) {
+    const res = await fetch(`${this.env.VECTORIZE_WORKER_URL}/process`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${this.env.WORKER_AUTH_TOKEN}`,
+      },
+      body: JSON.stringify({ documentId }),
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      this.logger.error(
+        "vectorization trigger failed",
+        new Error(String(res.status)),
+        { body },
+      );
+    }
   }
 }
 
-// ===== Webhook Handler =====
-class WebhookHandler {
-  private logger: Logger;
-
-  constructor(private secret: string | undefined, logger: Logger) {
-    this.logger = logger.child({ service: 'WebhookHandler' });
-  }
-
-  async verifySignature(request: Request): Promise<WebhookVerification> {
-    if (!this.secret) {
-      return { isValid: true };
-    }
-
-    const signature = request.headers.get('X-Fireflies-Signature');
-    const timestamp = request.headers.get('X-Fireflies-Timestamp');
-    
-    if (!signature || !timestamp) {
-      this.logger.warn('Missing webhook signature headers');
-      return { isValid: false };
-    }
-
-    const body = await request.text();
-    const message = `${timestamp}.${body}`;
-    
-    const encoder = new TextEncoder();
-    const key = await crypto.subtle.importKey(
-      'raw',
-      encoder.encode(this.secret),
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['sign']
-    );
-    
-    const signatureBuffer = await crypto.subtle.sign(
-      'HMAC',
-      key,
-      encoder.encode(message)
-    );
-    
-    const expectedSignature = btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)));
-    
-    return {
-      isValid: signature === expectedSignature,
-      signature,
-      timestamp,
-    };
-  }
-
-  parsePayload(body: any): FirefliesWebhookPayload {
-    return {
-      event: body.event || 'transcript.created',
-      transcript_id: body.transcript_id,
-      timestamp: body.timestamp || new Date().toISOString(),
-      data: body.data,
-    };
-  }
-}
-
-// ===== Main Worker Handler =====
+// ===== HTTP Handlers =====
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<Response> {
     const url = new URL(request.url);
-    const logger = new Logger('info');
+    const logger = new Logger("info");
     logger.setContext({ path: url.pathname, method: request.method });
 
-    // Initialize services
-    const processor = new TranscriptProcessor(env);
-    const rateLimiter = new RateLimiter(
-      env.CACHE,
-      env.RATE_LIMIT_REQUESTS,
-      env.RATE_LIMIT_WINDOW
-    );
-
-    // CORS headers
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    const cors = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
     };
 
-    // Handle preflight
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: cors });
+    }
+
+    const rateLimiter = new RateLimiter(
+      env.CACHE,
+      Number(env.RATE_LIMIT_REQUESTS || 60),
+      Number(env.RATE_LIMIT_WINDOW || 60),
+    );
+
+    // Rate limit non-webhook routes
+    if (!url.pathname.startsWith("/webhook")) {
+      const ip = request.headers.get("CF-Connecting-IP") || "anon";
+      const state = await rateLimiter.checkLimit(ip);
+      if (!state.allowed) {
+        return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
+          status: 429,
+          headers: {
+            ...cors,
+            ...rateLimiter.getHeaders(state),
+            "Content-Type": "application/json",
+          },
+        });
+      }
     }
 
     try {
-      // Rate limiting (except for webhooks)
-      if (!url.pathname.startsWith('/webhook')) {
-        const clientId = request.headers.get('CF-Connecting-IP') || 'unknown';
-        const rateLimit = await rateLimiter.checkLimit(clientId);
-        
-        if (!rateLimit.allowed) {
-          return new Response(
-            JSON.stringify({ error: 'Rate limit exceeded' }),
-            {
-              status: 429,
-              headers: {
-                ...corsHeaders,
-                ...rateLimiter.getHeaders(rateLimit),
-                'Content-Type': 'application/json',
-              },
-            }
-          );
-        }
-      }
-
-      // Route handlers
       switch (url.pathname) {
-        case '/webhook/fireflies': {
-          if (request.method !== 'POST') {
-            return new Response('Method not allowed', { status: 405 });
+        case "/webhook/fireflies": {
+          if (request.method !== "POST") {
+            return new Response("Method not allowed", { status: 405 });
           }
-
-          const webhookHandler = new WebhookHandler(env.FIREFLIES_WEBHOOK_SECRET, logger);
-          
-          // Verify signature
-          const verification = await webhookHandler.verifySignature(request.clone());
-          if (!verification.isValid) {
-            logger.warn('Invalid webhook signature');
-            return new Response('Unauthorized', { status: 401 });
+          const wh = new WebhookHandler(env.FIREFLIES_WEBHOOK_SECRET, logger);
+          const check = await wh.verifySignature(request.clone());
+          if (!check.isValid) {
+            return new Response("Unauthorized", { status: 401 });
           }
-
           const body = await request.json<any>();
-          const payload = webhookHandler.parsePayload(body);
-          
-          // Process asynchronously
-          if (payload.transcript_id) {
-            ctx.waitUntil(processor.processTranscript(payload.transcript_id));
+          const transcriptId = body?.transcript_id || body?.data?.id ||
+            body?.data?.transcript_id;
+          if (transcriptId) {
+            const proc = new TranscriptProcessor(
+              env,
+              logger.child({ route: "webhook" }),
+            );
+            ctx.waitUntil(
+              proc.processTranscript(transcriptId).then(() => proc.cleanup()),
+            );
           }
+          return new Response(JSON.stringify({ ok: true }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
 
+        case "/api/sync": {
+          if (request.method !== "POST") {
+            return new Response("Method not allowed", { status: 405 });
+          }
+          const body = await request.json<any>().catch(() => ({}));
+          const limit = Number(body.limit || env.SYNC_BATCH_SIZE || 25);
+          const proc = new TranscriptProcessor(
+            env,
+            logger.child({ route: "sync" }),
+          );
+          const result = await proc.syncAllTranscripts(limit);
+          await proc.cleanup();
+          return new Response(JSON.stringify(result), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
+
+        case "/api/process": {
+          if (request.method !== "POST") {
+            return new Response("Method not allowed", { status: 405 });
+          }
+          const body = await request.json<any>();
+          if (!body?.transcript_id) {
+            return new Response("Missing transcript_id", { status: 400 });
+          }
+          const proc = new TranscriptProcessor(
+            env,
+            logger.child({ route: "process" }),
+          );
+          await proc.processTranscript(body.transcript_id, body.options);
+          await proc.cleanup();
           return new Response(
-            JSON.stringify({ success: true }),
-            {
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-            }
+            JSON.stringify({ ok: true, transcript_id: body.transcript_id }),
+            { headers: { ...cors, "Content-Type": "application/json" } },
           );
         }
 
-        case '/api/sync': {
-          if (request.method !== 'POST') {
-            return new Response('Method not allowed', { status: 405 });
+        case "/api/search": {
+          if (request.method !== "POST") {
+            return new Response("Method not allowed", { status: 405 });
           }
-
           const body = await request.json<any>();
-          const limit = body.limit || env.SYNC_BATCH_SIZE;
-
-          const result = await processor.syncAllTranscripts(limit);
-
-          return new Response(
-            JSON.stringify(result),
-            {
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-            }
+          if (!body?.query) {
+            return new Response("Missing query", { status: 400 });
+          }
+          const proc = new TranscriptProcessor(
+            env,
+            logger.child({ route: "search" }),
           );
+          const results = await proc.search(body.query, body.options || {});
+          await proc.cleanup();
+          return new Response(JSON.stringify({ results }), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
         }
 
-        case '/api/process': {
-          if (request.method !== 'POST') {
-            return new Response('Method not allowed', { status: 405 });
+        case "/api/analytics": {
+          if (request.method !== "GET") {
+            return new Response("Method not allowed", { status: 405 });
           }
+          const proc = new TranscriptProcessor(
+            env,
+            logger.child({ route: "analytics" }),
+          );
+          const data = await proc.analytics();
+          await proc.cleanup();
+          return new Response(JSON.stringify(data), {
+            headers: { ...cors, "Content-Type": "application/json" },
+          });
+        }
 
-          const body = await request.json<any>();
-          if (!body.transcript_id) {
-            return new Response('Missing transcript_id', { status: 400 });
-          }
-
-          await processor.processTranscript(body.transcript_id, body.options);
-
+        case "/api/health":
+        case "/health": {
           return new Response(
-            JSON.stringify({ 
-              success: true, 
-              message: `Processed transcript ${body.transcript_id}` 
+            JSON.stringify({
+              status: "healthy",
+              ts: new Date().toISOString(),
+              service: "fireflies-ingest",
             }),
-            {
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-            }
-          );
-        }
-
-        case '/api/search': {
-          if (request.method !== 'POST') {
-            return new Response('Method not allowed', { status: 405 });
-          }
-
-          const body = await request.json<any>();
-          if (!body.query) {
-            return new Response('Missing query', { status: 400 });
-          }
-
-          const results = await processor.search(body.query, body.options);
-
-          return new Response(
-            JSON.stringify({ results }),
-            {
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-            }
-          );
-        }
-
-        case '/api/analytics': {
-          if (request.method !== 'GET') {
-            return new Response('Method not allowed', { status: 405 });
-          }
-
-          const analytics = await processor.getAnalytics();
-
-          return new Response(
-            JSON.stringify(analytics),
-            {
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-            }
-          );
-        }
-
-        case '/api/health': {
-          return new Response(
-            JSON.stringify({ 
-              status: 'healthy', 
-              timestamp: new Date().toISOString(),
-              version: '2.0.0',
-            }),
-            {
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-            }
+            { headers: { ...cors, "Content-Type": "application/json" } },
           );
         }
 
         default:
-          return new Response('Not found', { status: 404 });
+          return new Response("Not found", { status: 404, headers: cors });
       }
-    } catch (error: any) {
-      logger.error('Worker error', error);
+    } catch (err: any) {
+      logger.error("handler error", err);
       return new Response(
-        JSON.stringify({ error: error.message || 'Internal server error' }),
+        JSON.stringify({ error: err?.message || "Internal error" }),
         {
           status: 500,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        }
+          headers: { ...cors, "Content-Type": "application/json" },
+        },
       );
-    } finally {
-      // Cleanup
-      ctx.waitUntil(processor.cleanup());
     }
   },
 
-  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    const logger = new Logger('info');
-    logger.info('Running scheduled sync', { cron: event.cron });
-    
-    const processor = new TranscriptProcessor(env);
-    
+  async scheduled(
+    event: ScheduledEvent,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<void> {
+    const logger = new Logger("info");
+    logger.info("cron start", { cron: (event as any).cron });
+    const proc = new TranscriptProcessor(env, logger.child({ route: "cron" }));
     try {
-      const result = await processor.syncAllTranscripts(env.SYNC_BATCH_SIZE);
-      logger.info('Scheduled sync completed', result);
-    } catch (error) {
-      logger.error('Scheduled sync failed', error as Error);
+      const res = await proc.syncAllTranscripts(env.SYNC_BATCH_SIZE || 25);
+      logger.info("cron done", res);
+    } catch (e: any) {
+      logger.error("cron failed", e);
     } finally {
-      await processor.cleanup();
+      await proc.cleanup();
     }
   },
 } satisfies ExportedHandler<Env>;
