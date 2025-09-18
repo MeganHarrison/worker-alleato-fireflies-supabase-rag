@@ -4,52 +4,56 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Fireflies-Supabase RAG Worker** - A Cloudflare Worker application that integrates Fireflies.ai meeting transcripts with Supabase for storage and implements a production-ready RAG (Retrieval-Augmented Generation) system with vector search capabilities.
+**Fireflies Ingest Worker** - A Cloudflare Worker that integrates Fireflies.ai meeting transcripts with Supabase for storage. This is an **ingest-only worker** that handles transcript fetching, storage, and metadata management. Vector embeddings and search are delegated to a separate vectorizer worker.
 
 **Version:** 2.0.0 (TypeScript implementation with Supabase)
+
+**Current Status:** Production-ready ingest system with 487+ transcripts processed. Deployed at `https://worker-alleato-fireflies-rag.megan-d14.workers.dev`
 
 ## Tech Stack
 
 - **Runtime:** Cloudflare Workers with TypeScript
-- **Database:** Supabase PostgreSQL with pgvector extension
-- **Storage:** Supabase Storage for transcript files
-- **AI/ML:** Cloudflare AI for embeddings (BGE base model - 768 dimensions)
-- **Caching:** Cloudflare KV for embedding cache
+- **Database:** Supabase PostgreSQL (uses `documents` and `document_chunks` tables)
+- **Storage:** Supabase Storage for transcript files (bucket: "meetings")
+- **Caching:** Cloudflare KV for rate limiting and flags
 - **Connection:** Cloudflare Hyperdrive for PostgreSQL optimization
 - **Dependencies:** 
   - `@supabase/supabase-js` for Supabase integration
-  - `postgres` (v3.4.5+) for database queries
+  - `postgres` (v3.4.5+) for direct database queries
+
+**Note:** Vector embeddings and search are handled by a separate vectorizer worker (not included in this repo).
 
 ## Architecture
 
-### Core Services (`src/`)
+### Architecture Overview
 
-1. **Main Worker** (`index.ts`):
-   - HTTP request handling with CORS
-   - Rate limiting per IP
-   - Scheduled sync (cron: daily at 2 AM)
-   - Webhook processing for Fireflies events
-   - API endpoints for search, sync, analytics
+This worker is an **ingest-only system** with the following responsibilities:
 
-2. **Service Modules** (`services/`):
-   - `cache.ts` - KV-based caching with TTL and SHA-256 hashing
-   - `rate-limiter.ts` - Request rate limiting with sliding window
-   - `logger.ts` - Structured logging with levels and context
+**Owned by THIS worker:**
+- ✅ Fireflies GraphQL client (fetch transcript lists and full transcripts)
+- ✅ Supabase Storage upload of markdown transcripts (with date-title naming)
+- ✅ PostgreSQL insert/upsert of document records 
+- ✅ Webhook verification (HMAC) + rate limiting + status endpoints
+- ✅ Dispatch to separate Vectorizer Worker for embeddings
 
-3. **Type Definitions** (`types.ts`):
-   - Comprehensive TypeScript interfaces
-   - Environment configuration types
-   - API request/response types
+**Delegated to VECTORIZER WORKER:**
+- → Transcript chunking (speaker-aware)
+- → Embedding generation (OpenAI/Cloudflare AI)
+- → Insert document_chunks rows with pgvector embeddings
+- → Update processing status and metadata
 
-### Core Classes
+### Core Implementation (`src/index.ts`)
 
-- **FirefliesClient**: GraphQL API integration with Fireflies.ai
-- **ChunkingStrategy**: Intelligent text chunking with conversation threading
-- **VectorizationService**: Embedding generation with caching
-- **DatabaseService**: PostgreSQL operations via Hyperdrive
-- **SupabaseStorageService**: File storage in Supabase buckets
-- **TranscriptProcessor**: Orchestrates transcript processing pipeline
-- **WebhookHandler**: Webhook signature verification and processing
+Single-file implementation with embedded classes:
+
+- **Logger**: Structured logging with context and levels
+- **CacheService**: KV-based caching for flags and rate limiting
+- **RateLimiter**: Per-IP sliding window rate limiting
+- **FirefliesClient**: GraphQL API client for fetching transcripts
+- **SupabaseStorageService**: File upload to `meetings/` bucket root with `YYYY-MM-DD - Title.md` naming
+- **DatabaseService**: Direct PostgreSQL operations via Hyperdrive (saves to `documents` table)
+- **WebhookHandler**: HMAC signature verification for Fireflies webhooks  
+- **TranscriptProcessor**: Main orchestrator that coordinates all services
 
 ## Development Commands
 
@@ -57,97 +61,147 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies
 pnpm install
 
-# Development server
-pnpm dev
+# Development server (requires Hyperdrive connection string)
+WRANGLER_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="postgresql://..." pnpm dev
+# Alternative development commands
+pnpm start      # Alias for pnpm dev
 
-# Run tests
-pnpm test
-pnpm test:watch
+# Type checking and linting
+pnpm lint       # Runs TypeScript type checking (tsc --noEmit)
 
-# Type checking
-pnpm lint
+# Testing
+pnpm test       # Run Vitest tests
+pnpm test:watch # Run tests in watch mode
 
-# Generate Cloudflare types
+# Generate TypeScript types for Cloudflare Workers
 pnpm cf-typegen
 
-# Setup (interactive)
-pnpm setup
-
-# Deploy
-pnpm deploy
-pnpm deploy:production
+# Deployment
+pnpm deploy                    # Deploy to default environment
+pnpm deploy:production         # Deploy to production environment
+npx wrangler deploy            # Direct wrangler deployment
 
 # View logs
-pnpm tail
+pnpm tail                      # View real-time worker logs
+npx wrangler tail              # Alternative log viewing
 
-# Manage secrets
-pnpm secrets:list
-npx wrangler secret put SECRET_NAME
+# Secrets management
+npx wrangler secret put FIREFLIES_API_KEY
+npx wrangler secret put SUPABASE_SERVICE_KEY  
+npx wrangler secret put SUPABASE_ANON_KEY
+npx wrangler secret put FIREFLIES_WEBHOOK_SECRET  # Optional
+pnpm secrets:list              # List all secrets
+
+# Setup commands for initial configuration
+pnpm setup                     # Run interactive setup script
+pnpm setup:kv                  # Create KV namespace
+pnpm setup:hyperdrive          # Instructions for Hyperdrive setup
+
+# Test scripts
+node scripts/test-fireflies-fetch.js     # Test Fireflies API connection
+node scripts/check-documents.js          # Check database documents count
+node scripts/check-storage.js            # Check Supabase Storage files
+node scripts/supabase-connection-test.js # Test Supabase connection
+node scripts/test-supabase.js            # Test Supabase operations
 ```
 
 ## Configuration
 
 ### Required Environment Variables (Secrets)
+- `FIREFLIES_API_KEY` - Fireflies.ai API key  
 - `SUPABASE_SERVICE_KEY` - Supabase service role key
-- `SUPABASE_ANON_KEY` - Supabase anonymous key  
-- `FIREFLIES_API_KEY` - Fireflies.ai API key
+- `SUPABASE_ANON_KEY` - Supabase anonymous key
 - `FIREFLIES_WEBHOOK_SECRET` (optional) - For webhook verification
 
 ### Configuration Variables (wrangler.jsonc)
-- `SUPABASE_URL` - Your Supabase project URL
+- `SUPABASE_URL` - Your Supabase project URL (currently: lgveqfnpkxvzbnnwuled.supabase.co)
 - `RATE_LIMIT_REQUESTS` - Max requests per window (default: 100)
 - `RATE_LIMIT_WINDOW` - Rate limit window in seconds (default: 60)
 - `SYNC_BATCH_SIZE` - Batch size for sync operations (default: 25)
-- `VECTOR_CACHE_TTL` - Embedding cache TTL in seconds (default: 3600)
+- `VECTOR_CACHE_TTL` - Cache TTL in seconds (default: 3600)
+- `ENABLE_REALTIME` - Enable real-time features (default: false)
 
-### Required Bindings
-- **Hyperdrive** (`HYPERDRIVE`) - PostgreSQL connection optimization
-- **KV Namespace** (`CACHE`) - For embedding and request caching
-- **AI** (`AI`) - Cloudflare AI for embeddings
+### Required Bindings (from wrangler.jsonc)
+- **Hyperdrive** (`HYPERDRIVE`) - ID: `81ca12eec05e4eeab6334050ae1a4dda`
+- **KV Namespace** (`CACHE`) - ID: `246a76714a2a49d5852dd7831dd6d731`
+- **AI** (`AI`) - Cloudflare AI binding (remote)
 
 ## Database Schema
 
-The application uses PostgreSQL with pgvector extension:
+The application uses PostgreSQL with pgvector extension. The schema is defined in `supabase-schema.sql`:
 
-- **meetings** table - Transcript metadata, keywords, action items
-- **meetings_chunks** table - Vectorized transcript chunks with embeddings
-- **meeting_search_view** - Convenience view for searching
+### Core Tables
 
-Key indexes:
-- IVFFlat index on embeddings for fast similarity search
-- B-tree indexes on department, project, date for filtering
+- **meetings** table - Transcript metadata, participants, action items, content (THIS worker writes here)
+  - Primary key: `id` (TEXT) - uses Fireflies transcript ID
+  - Stores title, date, duration, participants, keywords, action_items
+  - File URL pointing to Supabase Storage markdown file
+  
+- **meetings_chunks** table - Vectorized transcript chunks with embeddings (Vectorizer worker writes here)
+  - Primary key: `id` (SERIAL)
+  - Foreign key: `transcript_id` references `meetings(id)`
+  - Contains 768-dimensional vector embeddings for BGE model
+  - Includes speaker information and timing metadata
+
+**Note:** This worker only writes to the `meetings` table. The `meetings_chunks` table is populated by the separate vectorizer worker.
+
+### Important Schema Details
+- pgvector extension must be enabled: `CREATE EXTENSION IF NOT EXISTS vector;`
+- Embeddings are 768-dimensional vectors for BGE base model
+- Unique constraint on (transcript_id, chunk_index) in chunks table
+- Indexes optimized for date, department, project, and vector similarity queries
 
 ## API Endpoints
 
+**Production URL:** `https://worker-alleato-fireflies-rag.megan-d14.workers.dev`
+
 - `GET /api/health` - Health check with version info
-- `POST /api/sync` - Sync transcripts from Fireflies (batch)
-- `POST /api/process` - Process single transcript
-- `POST /api/search` - Semantic search with filters
-- `GET /api/analytics` - Usage analytics and statistics
-- `POST /webhook/fireflies` - Webhook endpoint for Fireflies events
+- `POST /api/sync` - Sync recent transcripts from Fireflies (batch processing)
+- `POST /api/process` - Process single transcript by Fireflies ID  
+- `POST /api/search` - ⚠️ Requires vectorizer worker (delegates to separate service)
+- `GET /api/analytics` - Usage analytics and database statistics
+- `POST /webhook/fireflies` - Webhook endpoint for real-time Fireflies events
+
+**Cron Schedule:** Automatic sync every 30 minutes (`*/30 * * * *`)
 
 ## Key Features
 
-1. **Vector Search**: pgvector with cosine similarity, IVFFlat indexing
-2. **Intelligent Caching**: SHA-256 based KV cache for embeddings
-3. **Rate Limiting**: Per-IP sliding window rate limiting
-4. **Conversation Threading**: Automatic detection of conversation threads
-5. **Batch Processing**: Parallel processing with configurable batch sizes
-6. **Structured Logging**: Context-aware logging with levels
-7. **Webhook Security**: HMAC signature verification
-8. **Scheduled Sync**: Automatic daily synchronization
+1. **Fireflies Integration**: GraphQL API client for fetching transcripts and metadata
+2. **Smart Storage**: Files saved as `YYYY-MM-DD - Meeting Title.md` in Supabase Storage
+3. **Rate Limiting**: Per-IP sliding window rate limiting (100 req/min)
+4. **Batch Processing**: Parallel processing with configurable batch sizes (default: 25)  
+5. **Structured Logging**: JSON logging with context and levels
+6. **Webhook Security**: HMAC signature verification for Fireflies webhooks
+7. **Scheduled Sync**: Automatic sync every 30 minutes
+8. **Database Integration**: Direct PostgreSQL operations via Hyperdrive connection
 
 ## Testing
 
 Tests use Vitest with Cloudflare Workers pool configuration. Test files in `test/` directory.
 
+### Test Commands
 ```bash
 # Run all tests
 pnpm test
 
-# Watch mode
+# Watch mode  
 pnpm test:watch
 ```
+
+### Test Structure
+- `test/index.spec.ts` - Main worker tests (currently basic Hello World tests)
+- `test/env.d.ts` - TypeScript environment definitions for tests
+- `test/tsconfig.json` - Test-specific TypeScript configuration
+
+### Manual Testing Scripts
+Located in `scripts/` directory for integration testing:
+- `test-fireflies-fetch.js` - Validates Fireflies GraphQL API connectivity
+- `check-documents.js` - Verifies database document counts and recent entries
+- `check-storage.js` - Confirms Supabase Storage file uploads
+- `supabase-connection-test.js` - Tests direct Supabase connection
+- `test-supabase.js` - Comprehensive Supabase operations testing
+
+**Note:** The main test suite appears to be placeholder tests. Use the manual testing scripts for thorough integration validation.
 
 ## Deployment Checklist
 
@@ -301,30 +355,30 @@ LIMIT 10
 - B-tree indexes on filter columns (department, project, date)
 - Unique constraint on (transcript_id, chunk_index)
 
-## Current Limitations & Future Enhancements
+## Current Status & Important Notes
+
+### Production Deployment
+- **Live URL**: `https://worker-alleato-fireflies-rag.megan-d14.workers.dev`
+- **Database**: 487+ documents successfully ingested
+- **Storage**: 86+ transcript files in Supabase Storage bucket "meetings"
+- **Status**: Production-ready ingest system working correctly
 
 ### Current Limitations
-1. **No Chat Interface**: Returns chunks, not conversational responses
-2. **No Answer Generation**: Pure retrieval, no LLM generation
-3. **No Real-time Processing**: Works with completed transcripts only
-4. **Fixed Embedding Model**: BGE base only (768 dims)
+1. **Ingest Only**: This worker does NOT handle vector embeddings or search
+2. **Search Delegation**: `/api/search` endpoint requires separate vectorizer worker
+3. **No Chat Interface**: Pure ingest system, not a chatbot
+4. **Completed Transcripts Only**: Works with finished Fireflies transcripts
 
-### Potential Enhancements
-1. **Add Chat Generation**: 
-   - Integrate with Claude/GPT for answer generation
-   - Use retrieved chunks as context
-   
-2. **Improved Chunking**:
-   - Semantic chunking based on topic changes
-   - Dynamic chunk sizes based on content
-   
-3. **Enhanced Search**:
-   - Hybrid search (keyword + semantic)
-   - Re-ranking with cross-encoder
-   
-4. **Real-time Features**:
-   - Webhook processing for immediate sync
-   - Live transcript updates
+### Missing Components
+- **Vectorizer Worker**: Separate service needed for chunking and embeddings
+  - Expected to handle OpenAI/Cloudflare AI embeddings
+  - Should populate `document_chunks` table
+  - Must be deployed separately and configured via `VECTORIZE_WORKER_URL`
+
+### File Naming Convention  
+Storage files use format: `YYYY-MM-DD - Meeting Title.md`
+- Example: `2025-09-15 - Goodwill Bloomington RFI Update.md`
+- Old files still use Fireflies ID format until reprocessed
 
 ## Testing & Development
 
@@ -358,40 +412,42 @@ curl -X POST http://localhost:8787/api/search \
 2. **Action Items Array**: Fixed - properly checks array type
 3. **Local Postgres**: Use mock connection string for dev
 
-## Code Organization
+## Code Architecture
 
-### Main Classes in index.ts
+### Main Implementation (`src/index.ts`)
 
-1. **FirefliesClient** (lines 57-161)
-   - GraphQL queries to Fireflies API
-   - Transcript fetching and formatting
+The worker is implemented as a **single-file architecture** (~1091 lines) with embedded classes and services. This design choice optimizes for Cloudflare Workers deployment and reduces bundle size.
 
-2. **ChunkingStrategy** (lines 162-261)
-   - Speaker-based chunking logic
-   - Conversation thread detection
+#### Core Classes (Embedded in index.ts)
+Based on the file structure and documentation, the main classes include:
 
-3. **VectorizationService** (lines 262-327)
-   - Embedding generation with Cloudflare AI
-   - Caching layer for embeddings
+1. **Logger** - Structured logging with context and levels
+2. **CacheService** - KV-based caching for flags and rate limiting  
+3. **RateLimiter** - Per-IP sliding window rate limiting
+4. **FirefliesClient** - GraphQL API client for fetching transcripts
+5. **SupabaseStorageService** - File upload to `meetings/` bucket root
+6. **DatabaseService** - Direct PostgreSQL operations via Hyperdrive
+7. **WebhookHandler** - HMAC signature verification for Fireflies webhooks
+8. **TranscriptProcessor** - Main orchestrator coordinating all services
 
-4. **DatabaseService** (lines 328-487)
-   - PostgreSQL operations via Hyperdrive
-   - Vector search implementation
+#### Modular Services (`src/services/`)
+Separate service modules for reusable functionality:
+- `cache.ts` - Generic caching layer with KV
+- `logger.ts` - Structured logging service  
+- `rate-limiter.ts` - IP-based rate limiting logic
 
-5. **SupabaseStorageService** (lines 488-534)
-   - File upload to Supabase Storage
-   - Public URL generation
+#### Type Definitions (`src/types.ts`)
+Comprehensive TypeScript interfaces including:
+- `Env` - Worker environment bindings and configuration
+- `TranscriptMetadata` - Meeting metadata structure
+- `FirefliesTranscript` - Fireflies API response shapes
+- `TranscriptChunk` - Vector chunk representations
+- `SearchOptions`, `SyncResult` - API operation types
 
-6. **TranscriptProcessor** (lines 665-761)
-   - Orchestrates entire processing pipeline
-   - Manages sync operations
+### Architecture Principles
 
-7. **WebhookHandler** (lines 762-800)
-   - Webhook signature verification
-   - Event processing
-
-### Service Modules
-
-- **cache.ts**: Generic caching with KV
-- **logger.ts**: Structured logging
-- **rate-limiter.ts**: IP-based rate limiting
+1. **Separation of Concerns**: Each class handles a specific domain (storage, database, webhooks)
+2. **Dependency Injection**: Services are injected into the main processor
+3. **Error Boundaries**: Structured error handling with logging context
+4. **Async Processing**: All operations use modern async/await patterns
+5. **Type Safety**: Full TypeScript coverage with strict type checking

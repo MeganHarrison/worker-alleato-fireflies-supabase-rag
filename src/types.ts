@@ -79,6 +79,14 @@ export interface FirefliesTranscript {
   summary?: {
     keywords?: string[];
     action_items?: string[];
+    overview?: string;
+    bullet_gist?: string[];
+    outline?: string[];
+    shorthand_bullet?: string[];
+    gist?: string;
+    short_summary?: string;
+    short_overview?: string;
+    topics_discussed?: string[];
   };
 }
 

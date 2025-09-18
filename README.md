@@ -1,245 +1,258 @@
-# Fireflies-Supabase RAG Worker
+# Fireflies Ingest Worker
 
-A production-ready Cloudflare Worker that integrates Fireflies.ai meeting transcripts with Supabase for storage and implements a Retrieval-Augmented Generation (RAG) system with vector search capabilities.
+A Cloudflare Worker that automatically syncs meeting transcripts from Fireflies.ai and stores them in Supabase. This is an **ingest-only system** that handles transcript fetching, storage, and metadata management. Vector embeddings and search are handled by a separate vectorizer worker.
 
 ## Table of Contents
-- [Overview](#overview)
-- [Features](#features)
-- [Architecture](#architecture)
-- [Data Flow](#data-flow)
-- [Chunking Strategies](#chunking-strategies)
+
+- [What This System Does](#what-this-system-does)
+- [How It Works](#how-it-works)
+- [Data Storage](#data-storage)
+- [How It's Triggered](#how-its-triggered)
 - [API Endpoints](#api-endpoints)
-- [Database Schema](#database-schema)
-- [Installation](#installation)
 - [Configuration](#configuration)
 - [Deployment](#deployment)
 - [Usage Examples](#usage-examples)
 - [Monitoring](#monitoring)
-- [Troubleshooting](#troubleshooting)
 
-## Overview
+## What This System Does
 
-This worker automatically syncs meeting transcripts from Fireflies.ai, processes them into searchable chunks with embeddings, and provides a semantic search API for retrieving relevant meeting content. It's designed for organizations that need to make their meeting history searchable and accessible.
+### ✅ This Worker Handles
 
-### What This System Does
+1. **Fireflies Integration**: Fetches transcripts via GraphQL API
+2. **Metadata Extraction**: Extracts title, date, participants, keywords, action items
+3. **File Storage**: Saves transcripts as Markdown files in Supabase Storage
+4. **Database Records**: Stores metadata in PostgreSQL `documents` table
+5. **Webhook Processing**: Handles real-time Fireflies webhook events
+6. **Batch Sync**: Processes multiple transcripts in parallel batches
 
-1. **Syncs** meeting transcripts from Fireflies.ai (scheduled or on-demand)
-2. **Processes** transcripts into intelligent chunks preserving speaker context
-3. **Generates** vector embeddings using Cloudflare AI (BGE base model)
-4. **Stores** metadata in PostgreSQL and files in Supabase Storage
-5. **Provides** semantic search API to find relevant meeting content
-6. **Tracks** conversation threads and speaker patterns
+### ❌ This Worker Does NOT Handle
 
-### What This System Does NOT Do
+- **Vector Embeddings**: Delegated to separate vectorizer worker
+- **Transcript Chunking**: Handled by vectorizer worker
+- **Semantic Search**: Requires vectorizer worker to populate embeddings
+- **Chat/Answer Generation**: Pure ingest system, not a chatbot
+- **Real-time Transcription**: Only processes completed Fireflies transcripts
 
-- **No Chat Interface**: This is a retrieval system, not a chatbot
-- **No Answer Generation**: Returns relevant chunks, doesn't generate answers
-- **No Real-time Transcription**: Works with completed Fireflies transcripts only
+## How It Works
 
-## Features
+### Processing Pipeline
 
-### Core Capabilities
+```
+1. Trigger (Cron/Webhook/API) 
+        ↓
+2. Fetch from Fireflies API
+        ↓
+3. Extract Metadata
+        ↓
+4. Generate Markdown
+        ↓
+5. Upload to Supabase Storage
+        ↓
+6. Save to PostgreSQL
+        ↓
+7. Trigger Vectorizer Worker (Optional)
+```
 
-- 🔄 **Automatic Sync**: Daily scheduled sync at 2 AM UTC
-- 🎯 **Smart Chunking**: Speaker-aware chunking with conversation threading
-- 🔍 **Semantic Search**: Vector similarity search using pgvector
-- 📊 **Analytics**: Usage statistics and system metrics
-- 🪝 **Webhook Support**: Real-time sync when meetings complete
-- 💾 **Dual Storage**: PostgreSQL for structured data, Supabase Storage for files
-- ⚡ **Caching**: Embedding cache to reduce AI calls
-- 🔒 **Rate Limiting**: Per-IP request throttling
-
-### Technical Features
-
-- **TypeScript**: Fully typed for reliability
-- **Modular Architecture**: Separated services for maintainability
-- **Connection Pooling**: Hyperdrive for PostgreSQL optimization
-- **Batch Processing**: Parallel processing with configurable batch sizes
-- **Error Resilience**: Continues processing even with individual failures
-- **Structured Logging**: Context-aware logging with levels
-
-## Architecture
+### Architecture Overview
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Fireflies.ai   │────▶│ Cloudflare Worker│────▶│    Supabase     │
-│   (GraphQL)     │     │                  │     │   PostgreSQL    │
-└─────────────────┘     │   - Fetch        │     │   + Storage     │
-                        │   - Process      │     └─────────────────┘
-                        │   - Chunk        │              │
-                        │   - Vectorize    │              │
+│  Fireflies.ai   │────▶│ Ingest Worker    │────▶│    Supabase     │
+│   (GraphQL)     │     │  (This System)   │     │ PostgreSQL +    │
+└─────────────────┘     │                  │     │ Storage         │
+                        │ - Fetch          │     └─────────────────┘
+                        │ - Transform      │              │
+                        │ - Store          │              │
                         └──────────────────┘              │
                                 │                         │
                                 ▼                         ▼
                         ┌──────────────────┐     ┌─────────────────┐
-                        │  Cloudflare AI   │     │  Vector Search  │
-                        │  (Embeddings)    │     │   (pgvector)    │
-                        └──────────────────┘     └─────────────────┘
+                        │ Vectorizer Worker│     │ Stored Files    │
+                        │ (Separate System)│     │ meetings/       │
+                        └──────────────────┘     │ transcripts/    │
+                                                 └─────────────────┘
 ```
 
-## Data Flow
+## Data Storage
 
-### 1. Sync Flow
+### 🗄️ PostgreSQL Tables (via Supabase)
+
+#### `documents` Table
+**Purpose**: Stores meeting metadata and full content  
+**Written by**: This ingest worker  
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | UUID | Auto-generated primary key |
+| title | TEXT | Meeting title from Fireflies |
+| source | TEXT | Always "fireflies" |
+| content | TEXT | Full markdown transcript |
+| category | TEXT | Always "meeting" |
+| participants | TEXT[] | Array of participant emails |
+| summary | TEXT | Meeting overview |
+| action_items | TEXT[] | Array of action items |
+| bullet_points | TEXT[] | Array of key points |
+| fireflies_id | TEXT | Original Fireflies transcript ID (unique) |
+| fireflies_link | TEXT | Link to view in Fireflies app |
+| date | TIMESTAMP | Meeting date and time |
+| metadata | JSONB | Additional structured data |
+| created_at | TIMESTAMP | When record was created |
+| updated_at | TIMESTAMP | When record was last updated |
+
+#### `document_chunks` Table  
+**Purpose**: Stores vectorized text chunks for search  
+**Written by**: Separate vectorizer worker (NOT this system)
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | UUID | Chunk identifier |
+| document_id | UUID | Foreign key to documents.id |
+| content | TEXT | Chunk text content |
+| metadata | JSONB | Speaker, timing, thread info |
+| embedding | vector(768) | 768-dimensional vector embedding |
+
+### 📁 Supabase Storage
+
+#### Bucket: `meetings`
+**Path Structure**: `transcripts/{filename}`  
+**Naming Convention**: `YYYY-MM-DD - Meeting Title.md`
+
+**Examples**:
+- `2025-09-15 - Weekly Team Standup.md`
+- `2025-09-14 - Product Review Meeting.md`
+- `2025-09-13 - Client Strategy Session.md`
+
+**Content Format**: Structured Markdown with:
+- Meeting metadata (date, duration, participants)
+- Summary and key points
+- Action items
+- Full transcript with speaker attribution
+
+### 🗂️ File Organization
+
 ```
-Fireflies API → Transcript Fetch → Metadata Extraction → Storage Upload
-                                          ↓
-                                   Chunking Strategy
-                                          ↓
-                                   Embedding Generation
-                                          ↓
-                                   Database Storage
+Supabase Storage: meetings/
+└── transcripts/
+    ├── 2025-09-15 - Weekly Team Standup.md
+    ├── 2025-09-15 - Product Review Meeting.md
+    ├── 2025-09-14 - Client Strategy Session.md
+    └── ... (487+ files currently stored)
 ```
 
-### 2. Search Flow
-```
-Search Query → Generate Embedding → Vector Similarity Search → Return Results
-                                           ↓
-                                   Apply Filters (date, dept, etc.)
-                                           ↓
-                                   Rank by Relevance
-```
+## How It's Triggered
 
-## Chunking Strategies
+### 1. ⏰ Automatic Cron Schedule
+**Frequency**: Every 30 minutes  
+**Schedule**: `*/30 * * * *`  
+**Action**: Syncs recent transcripts from Fireflies
 
-### Speaker-Based Chunking (Default)
+### 2. 🎣 Webhook Events
+**URL**: `https://worker-alleato-fireflies-rag.megan-d14.workers.dev/webhook/fireflies`  
+**Trigger**: When meetings complete in Fireflies  
+**Action**: Immediately processes the new transcript  
+**Security**: HMAC signature verification (optional)
 
-The system uses intelligent chunking that preserves conversation context:
+### 3. 📞 Manual API Calls
 
-```typescript
-{
-  maxChunkSize: 500,      // Maximum words per chunk
-  overlap: 50,            // Words overlap between chunks
-  bySpeaker: true,        // Group by speaker changes
-}
-```
-
-**Features:**
-- **Speaker Grouping**: Keeps speaker turns together
-- **Conversation Threading**: Detects related discussion threads
-- **Temporal Context**: Preserves timestamps for each chunk
-- **Overlap**: Maintains context between chunk boundaries
-
-**Example Chunk:**
-```json
-{
-  "text": "Let me explain the quarterly results...",
-  "speaker": "John Smith",
-  "startTime": 120.5,
-  "endTime": 145.3,
-  "chunkIndex": 3,
-  "conversationThread": "thread_001"
-}
+#### Batch Sync
+```bash
+curl -X POST https://worker-alleato-fireflies-rag.megan-d14.workers.dev/api/sync \
+  -H "Content-Type: application/json" \
+  -d '{"limit": 10}'
 ```
 
-### Simple Text Chunking (Alternative)
-
-For transcripts without speaker information:
-- Fixed-size chunks based on word count
-- Consistent overlap for context preservation
-- No speaker or timing metadata
+#### Single Transcript
+```bash
+curl -X POST https://worker-alleato-fireflies-rag.megan-d14.workers.dev/api/process \
+  -H "Content-Type: application/json" \
+  -d '{"transcript_id": "01K57347ME7T5K90M7RV121HN6"}'
+```
 
 ## API Endpoints
 
-### Health Check
+### Production URL
+`https://worker-alleato-fireflies-rag.megan-d14.workers.dev`
+
+### Available Endpoints
+
+#### Health Check
 ```http
 GET /api/health
 
 Response:
 {
   "status": "healthy",
-  "timestamp": "2025-08-28T02:30:00Z",
-  "version": "2.0.0"
+  "ts": "2025-09-15T21:00:00Z",
+  "service": "fireflies-ingest"
 }
 ```
 
-### Sync Transcripts
+#### Sync Recent Transcripts
 ```http
 POST /api/sync
 Content-Type: application/json
 
 {
-  "limit": 10,              // Optional: Max transcripts to sync
-  "startDate": "2025-08-01", // Optional: Start date filter
-  "endDate": "2025-08-28"    // Optional: End date filter
+  "limit": 25  // Optional: number of transcripts to sync
 }
 
 Response:
 {
   "success": true,
-  "processed": 8,
-  "failed": 2,
-  "errors": [...]
+  "processed": 15,
+  "failed": 0,
+  "errors": []
 }
 ```
 
-### Semantic Search
-```http
-POST /api/search
-Content-Type: application/json
-
-{
-  "query": "What were the action items from the product meeting?",
-  "options": {
-    "limit": 10,           // Max results (default: 10)
-    "threshold": 0.7,      // Similarity threshold (0-1)
-    "department": "Product", // Filter by department
-    "project": "Mobile App", // Filter by project
-    "startDate": "2025-08-01", // Date range filter
-    "endDate": "2025-08-28"
-  }
-}
-
-Response:
-{
-  "results": [
-    {
-      "chunkId": 123,
-      "transcriptId": "01K374MAQ92EM6Z9BVXT12AT7W",
-      "text": "The action items are: 1) Complete the design review...",
-      "speaker": "Jane Doe",
-      "similarity": 0.89,
-      "meetingTitle": "Product Planning Q3",
-      "meetingDate": "2025-08-15T14:00:00Z",
-      "department": "Product",
-      "fileUrl": "https://...supabase.co/storage/v1/object/public/meetings/..."
-    }
-  ]
-}
-```
-
-### Analytics
-```http
-GET /api/analytics
-
-Response:
-{
-  "totalMeetings": 150,
-  "totalChunks": 4500,
-  "averageChunksPerMeeting": 30,
-  "departments": ["Engineering", "Product", "Sales"],
-  "lastSync": "2025-08-28T02:00:00Z",
-  "storageUsed": "125MB"
-}
-```
-
-### Process Single Transcript
+#### Process Single Transcript
 ```http
 POST /api/process
 Content-Type: application/json
 
 {
-  "transcriptId": "01K374MAQ92EM6Z9BVXT12AT7W"
+  "transcript_id": "01K57347ME7T5K90M7RV121HN6"
 }
 
 Response:
 {
-  "success": true,
-  "chunksCreated": 45,
-  "fileUrl": "https://...supabase.co/storage/v1/object/public/meetings/..."
+  "ok": true,
+  "transcript_id": "01K57347ME7T5K90M7RV121HN6"
 }
 ```
 
-### Webhook (Fireflies)
+#### Get Analytics
+```http
+GET /api/analytics
+
+Response:
+{
+  "meetings": {
+    "total": 487,
+    "lastWeek": 25,
+    "lastMonth": 120
+  },
+  "chunks": {
+    "total": 0  // Populated by vectorizer worker
+  },
+  "storage": {
+    "filesCount": 86,
+    "totalSize": "125 MB"
+  }
+}
+```
+
+#### Search (Requires Vectorizer)
+```http
+POST /api/search  ⚠️ Delegates to separate vectorizer worker
+Content-Type: application/json
+
+{
+  "query": "action items from product meetings"
+}
+```
+
+#### Webhook Endpoint
 ```http
 POST /webhook/fireflies
 Content-Type: application/json
@@ -247,180 +260,145 @@ X-Fireflies-Signature: [HMAC signature]
 
 {
   "event": "meeting.completed",
-  "transcriptId": "01K374MAQ92EM6Z9BVXT12AT7W",
-  ...
+  "transcript_id": "01K57347ME7T5K90M7RV121HN6"
 }
-```
-
-## Database Schema
-
-### `meetings` Table
-Stores meeting metadata and summary information:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| id | TEXT | Fireflies transcript ID (Primary Key) |
-| title | TEXT | Meeting title |
-| date | TIMESTAMP | Meeting date and time |
-| duration | INTEGER | Duration in seconds |
-| participants | TEXT[] | Array of participant names |
-| speaker_count | INTEGER | Number of unique speakers |
-| meeting_type | TEXT | Type of meeting (standup, review, etc.) |
-| department | TEXT | Department (for filtering) |
-| project | TEXT | Project name (for filtering) |
-| keywords | TEXT[] | Array of keywords from summary |
-| action_items | TEXT[] | Array of action items |
-| file_url | TEXT | URL to markdown file in Storage |
-
-### `meetings_chunks` Table
-Stores vectorized transcript chunks:
-
-| Column | Type | Description |
-|--------|------|-------------|
-| id | SERIAL | Auto-incrementing ID (Primary Key) |
-| transcript_id | TEXT | Foreign key to meetings.id |
-| chunk_index | INTEGER | Order of chunk in transcript |
-| text | TEXT | Chunk text content |
-| speaker | TEXT | Speaker name (if available) |
-| start_time | NUMERIC | Start timestamp in seconds |
-| end_time | NUMERIC | End timestamp in seconds |
-| embedding | vector(768) | 768-dimensional embedding vector |
-| conversation_thread | TEXT | Thread identifier for related chunks |
-
-### Indexes
-- **IVFFlat index** on embeddings for fast similarity search
-- **B-tree indexes** on department, project, date for filtering
-- **Foreign key index** for efficient joins
-
-## Installation
-
-### Prerequisites
-
-1. **Cloudflare Account** with Workers enabled
-2. **Supabase Project** with:
-   - pgvector extension enabled
-   - Storage bucket named "meetings"
-3. **Fireflies.ai API Key**
-4. **Node.js 18+** and **pnpm** installed locally
-
-### Setup Steps
-
-1. **Clone the repository**
-```bash
-git clone [repository-url]
-cd worker-alleato-fireflies-supabase-rag
-```
-
-2. **Install dependencies**
-```bash
-pnpm install
-```
-
-3. **Configure environment**
-```bash
-cp .env.example .env.local
-# Edit .env.local with your values
-```
-
-4. **Set up database**
-```bash
-# Run the schema in Supabase SQL Editor
-psql -h [host] -U postgres -d postgres -f supabase-schema.sql
-```
-
-5. **Create KV namespace**
-```bash
-npx wrangler kv namespace create CACHE
-# Copy the ID to wrangler.jsonc
 ```
 
 ## Configuration
 
 ### Required Secrets
-Set these using `npx wrangler secret put [NAME]`:
+Set using `npx wrangler secret put [NAME]`:
 
-- `SUPABASE_SERVICE_KEY` - Service role key for admin operations
-- `SUPABASE_ANON_KEY` - Anonymous key for public operations
-- `FIREFLIES_API_KEY` - Your Fireflies API key
-- `FIREFLIES_WEBHOOK_SECRET` - (Optional) For webhook verification
+```bash
+npx wrangler secret put FIREFLIES_API_KEY
+npx wrangler secret put SUPABASE_SERVICE_KEY  
+npx wrangler secret put SUPABASE_ANON_KEY
+npx wrangler secret put FIREFLIES_WEBHOOK_SECRET  # Optional
+```
 
 ### Environment Variables (wrangler.jsonc)
 
 ```json
 {
   "vars": {
-    "SUPABASE_URL": "https://[project].supabase.co",
+    "SUPABASE_URL": "https://lgveqfnpkxvzbnnwuled.supabase.co",
     "RATE_LIMIT_REQUESTS": 100,
     "RATE_LIMIT_WINDOW": 60,
     "SYNC_BATCH_SIZE": 25,
-    "VECTOR_CACHE_TTL": 3600
+    "VECTOR_CACHE_TTL": 3600,
+    "ENABLE_REALTIME": false
   }
 }
 ```
 
-### Hyperdrive Configuration
+### Required Cloudflare Resources
 
-```bash
-# Create Hyperdrive config
-npx wrangler hyperdrive create my-hyperdrive \
-  --connection-string="postgresql://..."
-
-# Update ID in wrangler.jsonc
+```json
+{
+  "hyperdrive": [{
+    "binding": "HYPERDRIVE",
+    "id": "81ca12eec05e4eeab6334050ae1a4dda"
+  }],
+  "kv_namespaces": [{
+    "binding": "CACHE", 
+    "id": "246a76714a2a49d5852dd7831dd6d731"
+  }],
+  "ai": {
+    "binding": "AI"
+  }
+}
 ```
 
 ## Deployment
 
-### Quick Deploy
-```bash
-# Using the provided script
-./deploy.sh
+### Prerequisites
 
-# Or manually
+1. **Cloudflare Account** with Workers enabled
+2. **Supabase Project** with:
+   - PostgreSQL database
+   - Storage bucket named "meetings"
+3. **Fireflies.ai API Key**
+
+### Quick Deploy
+
+```bash
+# Clone and install
+git clone [repository-url]
+cd pm-rag-fireflies-ingest
+pnpm install
+
+# Set secrets
+npx wrangler secret put FIREFLIES_API_KEY
+npx wrangler secret put SUPABASE_SERVICE_KEY
+npx wrangler secret put SUPABASE_ANON_KEY
+
+# Deploy
 npx wrangler deploy
 ```
 
-### Production Checklist
-- ✅ All secrets configured
-- ✅ Database schema deployed
-- ✅ Storage bucket created
-- ✅ KV namespace created
-- ✅ Hyperdrive configured
-- ✅ Tested locally with `pnpm dev`
+### Database Setup
+
+```sql
+-- Enable required extensions
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Create tables (see supabase-schema.sql)
+-- Run the schema file in Supabase SQL Editor
+```
+
+### Local Development
+
+```bash
+# Requires Hyperdrive connection string for local dev
+WRANGLER_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE="postgresql://..." pnpm dev
+
+# Test endpoints
+curl http://localhost:62872/api/health
+```
 
 ## Usage Examples
 
-### Search for Action Items
+### Daily Sync Script
 ```javascript
-const response = await fetch('https://your-worker.workers.dev/api/search', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    query: 'action items mobile app launch',
-    options: {
-      department: 'Product',
-      threshold: 0.8
-    }
-  })
-});
+// Sync transcripts from last 24 hours
+async function dailySync() {
+  const response = await fetch('https://worker-alleato-fireflies-rag.megan-d14.workers.dev/api/sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ limit: 50 })
+  });
+  
+  const result = await response.json();
+  console.log(`Processed: ${result.processed}, Failed: ${result.failed}`);
+}
 ```
 
-### Sync Recent Meetings
+### Check System Status
 ```javascript
-const response = await fetch('https://your-worker.workers.dev/api/sync', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({
-    limit: 50,
-    startDate: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString()
-  })
-});
+async function checkStatus() {
+  // Health check
+  const health = await fetch('https://worker-alleato-fireflies-rag.megan-d14.workers.dev/api/health');
+  console.log(await health.json());
+  
+  // Analytics
+  const analytics = await fetch('https://worker-alleato-fireflies-rag.megan-d14.workers.dev/api/analytics');
+  const stats = await analytics.json();
+  console.log(`Total meetings: ${stats.meetings.total}`);
+  console.log(`Storage files: ${stats.storage.filesCount}`);
+}
 ```
 
-### Get Analytics
+### Process Specific Meeting
 ```javascript
-const response = await fetch('https://your-worker.workers.dev/api/analytics');
-const analytics = await response.json();
-console.log(`Total meetings: ${analytics.totalMeetings}`);
+async function processSpecificMeeting(transcriptId) {
+  const response = await fetch('https://worker-alleato-fireflies-rag.megan-d14.workers.dev/api/process', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transcript_id: transcriptId })
+  });
+  
+  return await response.json();
+}
 ```
 
 ## Monitoring
@@ -430,98 +408,127 @@ console.log(`Total meetings: ${analytics.totalMeetings}`);
 # Real-time logs
 npx wrangler tail
 
-# Or using pnpm
-pnpm tail
+# Filter for errors
+npx wrangler tail --format=pretty | grep ERROR
 ```
 
-### Log Levels
-- `ERROR` - Critical issues requiring attention
-- `WARN` - Non-critical issues or degraded performance
-- `INFO` - Important events (sync complete, etc.)
-- `DEBUG` - Detailed debugging information
+### Key Metrics to Monitor
 
-### Metrics to Monitor
-- Sync success/failure rates
-- Average processing time per transcript
-- Embedding cache hit rate
-- Vector search response times
-- Storage usage growth
+1. **Sync Success Rate**: Check `/api/analytics` for failed processing
+2. **Storage Growth**: Monitor Supabase Storage usage  
+3. **Database Size**: Track `documents` table growth
+4. **Processing Time**: Watch for timeout issues
+5. **Rate Limits**: Monitor for 429 errors
+
+### Test Scripts
+
+```bash
+# Test Fireflies connection
+node scripts/test-fireflies-fetch.js
+
+# Check database status  
+node scripts/check-documents.js
+
+# Verify storage files
+node scripts/check-storage.js
+```
+
+## Current Status
+
+### Production Deployment
+- **Live URL**: https://worker-alleato-fireflies-rag.megan-d14.workers.dev
+- **Database**: 487+ documents successfully ingested
+- **Storage**: 86+ transcript files stored
+- **Cron**: Running every 30 minutes automatically
+
+### Recent Transcripts Processed
+- Goodwill Bloomington RFI Update (2025-09-15)
+- Weekly Ops Updates (2025-09-15)  
+- Executive meetings (2025-09-15)
+- Project consultations (2025-09-15)
+
+### File Naming Examples
+New format (implemented):
+- `2025-09-15 - Goodwill Bloomington RFI Update.md`
+
+Old format (legacy files):
+- `01K57347ME7T5K90M7RV121HN6.md`
+
+## Integration with Vectorizer Worker
+
+This ingest worker is designed to work with a separate vectorizer worker:
+
+### What This Worker Provides
+- Clean, structured transcript data in `documents` table
+- Standardized metadata format
+- Reliable file storage in Supabase
+
+### What Vectorizer Worker Should Do
+- Read from `documents` table
+- Chunk transcript content (speaker-aware)
+- Generate embeddings using OpenAI/Cloudflare AI
+- Populate `document_chunks` table
+- Enable semantic search functionality
+
+### Integration Flow
+```
+Ingest Worker → documents table → Vectorizer Worker → document_chunks table
+```
 
 ## Troubleshooting
 
 ### Common Issues
 
-#### 1. Vector Dimension Mismatch
-**Error**: "expected 768 dimensions, got 384"
-**Solution**: Ensure you're using BGE base model in Cloudflare AI
+#### Transcript Not Processing
+1. Check Fireflies API key: `npx wrangler secret list`
+2. Verify transcript exists in Fireflies
+3. Check worker logs: `npx wrangler tail`
 
-#### 2. Database Connection Failed
-**Error**: "connection attempt failed"
-**Solution**: Check Hyperdrive configuration and connection string
+#### Database Connection Issues  
+1. Verify Hyperdrive configuration
+2. Check Supabase service key
+3. Test with: `node scripts/check-documents.js`
 
-#### 3. Rate Limit TTL Error
-**Error**: "Invalid expiration_ttl of 51"
-**Solution**: Already fixed in code - minimum TTL is 60 seconds
+#### Storage Upload Failures
+1. Check Supabase Storage permissions
+2. Verify "meetings" bucket exists
+3. Test with: `node scripts/check-storage.js`
 
-#### 4. Action Items Processing Error
-**Error**: "forEach is not a function"
-**Solution**: Already fixed - properly checks if action_items is an array
-
-#### 5. Large Transcript Timeout
-**Solution**: Reduce `SYNC_BATCH_SIZE` or increase chunk size
+#### Webhook Not Working
+1. Verify webhook URL in Fireflies settings
+2. Check HMAC signature if enabled
+3. Monitor `/webhook/fireflies` endpoint logs
 
 ### Debug Mode
-
-Enable debug logging:
-```typescript
-const logger = new Logger('DEBUG'); // Set in index.ts
-```
-
-### Testing Individual Components
-
+Enable detailed logging by checking worker logs:
 ```bash
-# Test health endpoint
-curl https://your-worker.workers.dev/api/health
-
-# Test with single transcript
-curl -X POST https://your-worker.workers.dev/api/sync \
-  -H "Content-Type: application/json" \
-  -d '{"limit": 1}'
+npx wrangler tail --format=pretty
 ```
 
-## Performance Optimization
+### Performance Issues
+- **Large batches**: Reduce `SYNC_BATCH_SIZE` 
+- **Timeouts**: Process transcripts individually
+- **Rate limits**: Increase `RATE_LIMIT_WINDOW`
 
-### Current Optimizations
-- **Connection Pooling**: Limited to 5 connections (Workers limit is 6)
-- **Batch Processing**: Embeddings processed in batches of 10
-- **Caching**: Vector embeddings cached for 1 hour
-- **IVFFlat Index**: 100 lists for optimal search performance
-- **Parallel Processing**: Async operations with Promise.all
+## Next Steps
 
-### Scaling Considerations
-- For >10,000 meetings: Increase IVFFlat lists to 200
-- For >100,000 chunks: Consider partitioning by date
-- Monitor embedding generation costs with high volume
+To build a complete RAG system:
 
-## Security
+1. **Deploy Vectorizer Worker**: 
+   - Chunk transcripts from `documents` table
+   - Generate embeddings 
+   - Populate `document_chunks` table
 
-- **Service Role Key**: Used only for admin operations
-- **Row Level Security**: Can be enabled in Supabase
-- **Webhook Verification**: HMAC signature validation
-- **Rate Limiting**: Prevents abuse
-- **CORS Headers**: Configured for browser access
+2. **Enable Search**:
+   - Configure vectorizer worker URL
+   - Test `/api/search` endpoint
 
-## Contributing
-
-See [CLAUDE.md](./CLAUDE.md) for AI assistant instructions and development guidelines.
-
-## License
-
-[Your License]
+3. **Add Chat Interface**:
+   - Use retrieved chunks as context
+   - Integrate with Claude/GPT for answers
 
 ## Support
 
-For issues or questions:
-- Check the [Troubleshooting](#troubleshooting) section
-- Review logs with `npx wrangler tail`
-- Open an issue on GitHub
+- **Logs**: `npx wrangler tail`
+- **Test Scripts**: See `scripts/` directory
+- **Configuration**: Check `CLAUDE.md` for development guidance

@@ -1,0 +1,61 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+        - production
+        - staging
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'production' }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+
+    - name: Install pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 8
+
+    - name: Install dependencies
+      run: pnpm install --frozen-lockfile
+
+    - name: Type check
+      run: pnpm lint
+
+    - name: Run tests
+      run: pnpm test
+
+    - name: Deploy to Cloudflare Workers
+      run: |
+        if [ "${{ github.event.inputs.environment }}" == "staging" ]; then
+          npx wrangler deploy --env staging
+        else
+          npx wrangler deploy
+        fi
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    - name: Update deployment status
+      if: success()
+      run: |
+        echo "✅ Successfully deployed to ${{ github.event.inputs.environment || 'production' }}"
+        echo "🔗 Worker URL: https://worker-alleato-fireflies-rag.megan-d14.workers.dev"

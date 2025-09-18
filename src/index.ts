@@ -75,6 +75,12 @@ export interface FirefliesTranscript {
     action_items?: string[];
     overview?: string;
     bullet_gist?: string[];
+    outline?: string[];
+    shorthand_bullet?: string[];
+    gist?: string;
+    short_summary?: string;
+    short_overview?: string;
+    topics_discussed?: string[];
   };
 }
 
@@ -333,8 +339,38 @@ class FirefliesClient {
       md += `## Summary\n${t.summary.overview}\n\n`;
     }
     
+    if (t.summary?.short_overview) {
+      md += `## Short Overview\n${t.summary.short_overview}\n\n`;
+    }
+    
+    if (t.summary?.gist) {
+      md += `## Gist\n${t.summary.gist}\n\n`;
+    }
+    
+    if (t.summary?.short_summary) {
+      md += `## Short Summary\n${t.summary.short_summary}\n\n`;
+    }
+    
+    if (Array.isArray(t.summary?.outline) && t.summary.outline.length) {
+      md += `## Outline\n` + t.summary.outline.map((x) =>
+        `- ${x}`
+      ).join("\n") + "\n\n";
+    }
+    
     if (Array.isArray(t.summary?.bullet_gist) && t.summary.bullet_gist.length) {
       md += `## Key Points\n` + t.summary.bullet_gist.map((x) =>
+        `- ${x}`
+      ).join("\n") + "\n\n";
+    }
+    
+    if (Array.isArray(t.summary?.shorthand_bullet) && t.summary.shorthand_bullet.length) {
+      md += `## Shorthand Bullets\n` + t.summary.shorthand_bullet.map((x) =>
+        `- ${x}`
+      ).join("\n") + "\n\n";
+    }
+    
+    if (Array.isArray(t.summary?.topics_discussed) && t.summary.topics_discussed.length) {
+      md += `## Topics Discussed\n` + t.summary.topics_discussed.map((x) =>
         `- ${x}`
       ).join("\n") + "\n\n";
     }
@@ -560,24 +596,24 @@ class DatabaseService {
     if (filters.department) {
       conds.push(
         `d.metadata->>'department' = ${
-          postgres.unsafeLiteral(`'${filters.department.replace(/'/g, "''")}'`)
+          this.sql.unsafe(`'${filters.department.replace(/'/g, "''")}'`)
         }`,
       );
     }
     if (filters.project) {
       conds.push(
         `d.project_id::text = ${
-          postgres.unsafeLiteral(`'${filters.project.replace(/'/g, "''")}'`)
+          this.sql.unsafe(`'${filters.project.replace(/'/g, "''")}'`)
         }`,
       );
     }
     if (filters.dateFrom) {
       conds.push(
-        `d.meeting_date >= ${postgres.unsafeLiteral(`'${filters.dateFrom}'`)}`,
+        `d.meeting_date >= ${this.sql.unsafe(`'${filters.dateFrom}'`)}`,
       );
     }
     if (filters.dateTo) {
-      conds.push(`d.meeting_date <= ${postgres.unsafeLiteral(`'${filters.dateTo}'`)}`);
+      conds.push(`d.meeting_date <= ${this.sql.unsafe(`'${filters.dateTo}'`)}`);
     }
     const whereClause = conds.join(" AND ");
 
@@ -1072,12 +1108,12 @@ export default {
   },
 
   async scheduled(
-    event: ScheduledEvent,
+    controller: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
     const logger = new Logger("info");
-    logger.info("cron start", { cron: (event as any).cron });
+    logger.info("cron start", { cron: (controller as any).cron });
     const proc = new TranscriptProcessor(env, logger.child({ route: "cron" }));
     try {
       const res = await proc.syncAllTranscripts(env.SYNC_BATCH_SIZE || 25);
