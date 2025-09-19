@@ -1,41 +1,56 @@
 /*
- * Fireflies Ingest Worker (Cloudflare Workers)
- * ------------------------------------------------------------
- * Purpose
- *   - Receive Fireflies transcripts (via webhook or on-demand sync)
- *   - Format to Markdown and upload to Supabase Storage (bucket: "meetings")
- *   - Upsert a meeting record in Postgres/Supabase and return its meeting.id
- *   - Trigger a dedicated Vectorizer Worker that handles chunking + OpenAI embeddings
- *   - Provide light analytics and vector search (reads DB only)
+ * ============================================================================
+ * FIREFLIES INGEST WORKER (CLOUDFLARE WORKERS)
+ * ============================================================================
  *
- * Responsibilities owned HERE
+ * ARCHITECTURE OVERVIEW:
+ * This is an ingest-only worker that acts as the entry point for Fireflies
+ * meeting transcripts. It handles data ingestion, storage, and metadata
+ * management, then delegates vector embedding generation to a separate service.
+ *
+ * DATA FLOW:
+ * 1. Fireflies Webhook/API → This Worker (ingest & store)
+ * 2. This Worker → Supabase Storage (markdown files)
+ * 3. This Worker → PostgreSQL (metadata in documents table)
+ * 4. This Worker → Vectorizer Worker (trigger embeddings)
+ * 5. Vectorizer Worker → PostgreSQL (chunks with vectors)
+ *
+ * KEY RESPONSIBILITIES OF THIS WORKER:
  *   ✓ Fireflies GraphQL client (fetch transcript lists and full transcript)
- *   ✓ Supabase Storage write of markdown transcript
- *   ✓ Postgres insert/upsert of meetings row (returns meeting.id)
+ *   ✓ Supabase Storage write of markdown transcript (root folder, date-title format)
+ *   ✓ Postgres insert/upsert of documents row (returns document.id)
  *   ✓ Webhook verification (HMAC) + rate limiting + basic status endpoints
- *   ✓ Dispatch to Vectorizer Worker: POST { meetingId }
+ *   ✓ Dispatch to Vectorizer Worker: POST { documentId }
+ *   ✓ Analytics and search endpoints (read-only operations)
  *
- * Responsibilities delegated to VECTORIZE WORKER (OpenAI)
- *   → Chunk transcript
- *   → Generate embeddings with OpenAI (e.g., text-embedding-3-large)
- *   → Insert meeting_chunks rows (with pgvector embeddings)
- *   → Update meetings.processing_status, processed_at, processing_error
+ * DELEGATED TO VECTORIZER WORKER (separate service):
+ *   → Chunk transcript into semantic segments
+ *   → Generate embeddings with OpenAI (text-embedding-3-large or similar)
+ *   → Insert document_chunks rows with pgvector embeddings
+ *   → Update documents.processing_status, processed_at, processing_error
  *
- * Required environment bindings (wrangler.toml)
+ * REQUIRED ENVIRONMENT BINDINGS (configured in wrangler.toml):
  *   vars = {
- *     SUPABASE_URL = "...",
- *     SUPABASE_SERVICE_KEY = "...",
- *     FIREFLIES_API_KEY = "...",
- *     FIREFLIES_WEBHOOK_SECRET = "...",
+ *     SUPABASE_URL = "https://[project].supabase.co",
+ *     SUPABASE_SERVICE_KEY = "service_role_key_with_admin_access",
+ *     FIREFLIES_API_KEY = "fireflies_api_key_for_graphql",
+ *     FIREFLIES_WEBHOOK_SECRET = "optional_webhook_verification_secret",
  *     VECTORIZE_WORKER_URL = "https://your-vectorizer.workers.dev",
- *     WORKER_AUTH_TOKEN = "long-random-token",
- *     SYNC_BATCH_SIZE = 25,
- *     RATE_LIMIT_REQUESTS = 60,
- *     RATE_LIMIT_WINDOW = 60
+ *     WORKER_AUTH_TOKEN = "shared_secret_for_worker_auth",
+ *     SYNC_BATCH_SIZE = 25,        // Transcripts to process per sync
+ *     RATE_LIMIT_REQUESTS = 60,    // Max requests per window
+ *     RATE_LIMIT_WINDOW = 60        // Window duration in seconds
  *   }
+ *
  *   [[kv_namespaces]]
- *     binding = "CACHE"
- *     id = "<kv-id>"
+ *     binding = "CACHE"             // KV for rate limiting and flags
+ *     id = "<your-kv-namespace-id>"
+ *
+ *   [[hyperdrive]]
+ *     binding = "HYPERDRIVE"        // Optional: Postgres connection pooling
+ *     id = "<your-hyperdrive-id>"
+ *
+ * ============================================================================
  */
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -70,8 +85,8 @@ export interface FirefliesTranscript {
   date: string; // ISO
   participants: string[];
   sentences?: Array<{ text: string; speaker_id: string; start_time: number }>; // optional on list, present on detail
-  summary?: { 
-    keywords?: string[]; 
+  summary?: {
+    keywords?: string[];
     action_items?: string[];
     overview?: string;
     bullet_gist?: string[];
@@ -81,6 +96,12 @@ export interface FirefliesTranscript {
     short_summary?: string;
     short_overview?: string;
     topics_discussed?: string[];
+    meeting_type?: string;
+    transcript_chapters?: Array<{
+      chapter: string;
+      start_time: number;
+      end_time: number;
+    }>;
   };
 }
 
@@ -91,11 +112,23 @@ export interface TranscriptMetadata {
   duration?: number; // seconds
   participants: string[];
   speakerCount?: number;
-  summary?: { 
-    keywords?: string[]; 
+  summary?: {
+    keywords?: string[];
     action_items?: string[];
     overview?: string;
     bullet_gist?: string[];
+    outline?: string[];
+    shorthand_bullet?: string[];
+    gist?: string;
+    short_summary?: string;
+    short_overview?: string;
+    topics_discussed?: string[];
+    meeting_type?: string;
+    transcript_chapters?: Array<{
+      chapter: string;
+      start_time: number;
+      end_time: number;
+    }>;
   };
 }
 
@@ -172,7 +205,15 @@ export interface WebhookVerification {
   timestamp?: string | null;
 }
 
-// ===== Minimal Logger =====
+// ============================================================================
+// UTILITY CLASSES
+// ============================================================================
+
+/**
+ * Structured Logger Class
+ * Provides JSON-formatted logging with contextual information.
+ * Designed for Cloudflare Workers environment where console.log is captured.
+ */
 class Logger {
   constructor(
     private level: "debug" | "info" | "warn" | "error" = "info",
@@ -216,7 +257,11 @@ class Logger {
   }
 }
 
-// ===== KV-backed Cache (simple flags) =====
+/**
+ * Cache Service using Cloudflare KV
+ * Provides simple key-value caching with TTL support.
+ * Used for idempotency checks and temporary flags.
+ */
 class CacheService {
   constructor(private kv: KVNamespace, private defaultTTLSeconds = 3600) {}
   async get(namespace: string, key: string): Promise<any | null> {
@@ -229,7 +274,11 @@ class CacheService {
   }
 }
 
-// ===== KV-backed Rate Limiter =====
+/**
+ * Rate Limiter using Cloudflare KV
+ * Implements sliding window rate limiting per IP address.
+ * Prevents abuse and ensures fair usage of the API.
+ */
 class RateLimiter {
   constructor(
     private kv: KVNamespace,
@@ -262,11 +311,26 @@ class RateLimiter {
   }
 }
 
-// ===== Fireflies Client =====
+// ============================================================================
+// FIREFLIES INTEGRATION
+// ============================================================================
+
+/**
+ * Fireflies GraphQL Client
+ * Handles all communication with Fireflies.ai API.
+ * Fetches transcript lists, individual transcripts, and formats to markdown.
+ */
 class FirefliesClient {
   private baseUrl = "https://api.fireflies.ai/graphql";
   constructor(private apiKey: string, private logger: Logger) {}
 
+  /**
+   * Execute GraphQL request against Fireflies API
+   * @param query - GraphQL query string
+   * @param variables - Query variables
+   * @returns GraphQL response data
+   * @throws Error on API failures or GraphQL errors
+   */
   async graphqlRequest(query: string, variables: Record<string, any> = {}) {
     this.logger.debug("fireflies gql", { variables });
     const res = await fetch(this.baseUrl, {
@@ -296,6 +360,12 @@ class FirefliesClient {
     return data.data;
   }
 
+  /**
+   * Fetch list of recent transcripts
+   * @param limit - Maximum number of transcripts to fetch (default: 25, max: 100)
+   * @param toDate - Optional date filter (ISO string)
+   * @returns Array of transcript metadata (without full sentences)
+   */
   async getTranscripts(
     limit = 25,
     toDate: string | null = null,
@@ -304,7 +374,20 @@ class FirefliesClient {
       query GetTranscripts($limit: Int, $toDate: DateTime) {
         transcripts(limit: $limit, toDate: $toDate) {
           id title transcript_url duration date participants
-          summary { keywords action_items overview bullet_gist }
+          summary {
+            keywords
+            action_items
+            overview
+            bullet_gist
+            gist
+            short_summary
+            short_overview
+            outline
+            shorthand_bullet
+            topics_discussed
+            meeting_type
+            transcript_chapters
+          }
         }
       }
     `;
@@ -315,13 +398,31 @@ class FirefliesClient {
     return data.transcripts as FirefliesTranscript[];
   }
 
+  /**
+   * Fetch complete transcript with sentences
+   * @param id - Fireflies transcript ID
+   * @returns Full transcript including sentences array
+   */
   async getTranscriptById(id: string): Promise<FirefliesTranscript> {
     const query = `
       query GetTranscriptContent($id: String!) {
         transcript(id: $id) {
           id title transcript_url duration date participants
           sentences { text speaker_id start_time }
-          summary { keywords action_items overview bullet_gist }
+          summary {
+            keywords
+            action_items
+            overview
+            bullet_gist
+            gist
+            short_summary
+            short_overview
+            outline
+            shorthand_bullet
+            topics_discussed
+            meeting_type
+            transcript_chapters
+          }
         }
       }
     `;
@@ -329,6 +430,12 @@ class FirefliesClient {
     return data.transcript as FirefliesTranscript;
   }
 
+  /**
+   * Convert Fireflies transcript to formatted Markdown
+   * Includes all metadata, summaries, action items, and full transcript.
+   * @param t - Fireflies transcript object
+   * @returns Formatted markdown string ready for storage
+   */
   formatTranscriptAsMarkdown(t: FirefliesTranscript): string {
     let md = `# ${t.title}\n\n`;
     md += `**Date:** ${new Date(t.date).toLocaleString()}\n`;
@@ -374,7 +481,21 @@ class FirefliesClient {
         `- ${x}`
       ).join("\n") + "\n\n";
     }
-    
+
+    if (t.summary?.meeting_type) {
+      md += `## Meeting Type\n${t.summary.meeting_type}\n\n`;
+    }
+
+    if (Array.isArray(t.summary?.transcript_chapters) && t.summary.transcript_chapters.length) {
+      md += `## Chapters\n`;
+      for (const chapter of t.summary.transcript_chapters) {
+        const startMin = Math.floor((chapter.start_time || 0) / 60);
+        const endMin = Math.floor((chapter.end_time || 0) / 60);
+        md += `- **[${startMin}:00 - ${endMin}:00]** ${chapter.chapter}\n`;
+      }
+      md += "\n";
+    }
+
     if (t.summary?.keywords?.length) {
       md += `## Keywords\n${t.summary.keywords.join(", ")}\n\n`;
     }
@@ -401,6 +522,11 @@ class FirefliesClient {
     return md;
   }
 
+  /**
+   * Extract simplified metadata from transcript
+   * @param t - Fireflies transcript object
+   * @returns Metadata object for database storage
+   */
   extractMetadata(t: FirefliesTranscript): TranscriptMetadata {
     return {
       id: t.id,
@@ -414,32 +540,51 @@ class FirefliesClient {
   }
 }
 
-// ===== Supabase Storage =====
+// ============================================================================
+// SUPABASE STORAGE SERVICE
+// ============================================================================
+
+/**
+ * Supabase Storage Service
+ * Handles uploading transcript markdown files to Supabase Storage.
+ * Files are saved in the root of the 'meetings' bucket with date-title format.
+ */
 class SupabaseStorageService {
   private bucket = "meetings";
   constructor(private client: SupabaseClient, private logger: Logger) {}
 
+  /**
+   * Upload transcript markdown to Supabase Storage
+   * Files are named as 'YYYY-MM-DD - Meeting Title.md' in the bucket root.
+   * @param transcriptId - Fireflies transcript ID (used as fallback filename)
+   * @param content - Markdown content to upload
+   * @param metadata - Optional metadata for generating descriptive filename
+   * @returns Public URL of the uploaded file
+   * @throws Error if upload fails
+   */
   async uploadTranscript(
     transcriptId: string,
     content: string,
     metadata?: TranscriptMetadata,
   ): Promise<string> {
-    // Generate filename with date - title format
-    let fileName = `transcripts/${transcriptId}.md`; // fallback
-    
+    // Generate filename with date - title format in root folder
+    // Default to transcript ID if metadata is unavailable
+    let fileName = `${transcriptId}.md`; // fallback for error cases
+
     if (metadata) {
-      // Format date as YYYY-MM-DD
+      // Format date as YYYY-MM-DD for consistent sorting
       const date = new Date(metadata.date);
       const dateStr = date.toISOString().split('T')[0];
-      
-      // Clean title for filename (remove invalid characters)
+
+      // Clean title for filesystem compatibility
       const cleanTitle = metadata.title
         .replace(/[^a-zA-Z0-9\s\-]/g, '') // Remove special chars except spaces and hyphens
-        .replace(/\s+/g, ' ') // Normalize spaces
-        .trim()
-        .substring(0, 100); // Limit length
-      
-      fileName = `transcripts/${dateStr} - ${cleanTitle}.md`;
+        .replace(/\s+/g, ' ')              // Normalize multiple spaces to single space
+        .trim()                            // Remove leading/trailing whitespace
+        .substring(0, 100);                // Limit length to prevent filesystem issues
+
+      // Final format: "2025-09-19 - Weekly Team Meeting.md"
+      fileName = `${dateStr} - ${cleanTitle}.md`;
     }
     
     this.logger.debug("upload storage", { fileName });
@@ -459,25 +604,43 @@ class SupabaseStorageService {
   }
 }
 
-// ===== Database (direct SQL) =====
+// ============================================================================
+// DATABASE SERVICE
+// ============================================================================
+
+/**
+ * Database Service using direct PostgreSQL connections
+ * Handles all database operations including document storage and vector search.
+ * Uses Postgres.js library with connection pooling via Hyperdrive.
+ */
 class DatabaseService {
   private sql: ReturnType<typeof postgres>;
   constructor(conn: string, private logger: Logger) {
     this.sql = postgres(conn, { max: 5, fetch_types: false });
   }
 
-  /** Upsert document (formerly meeting) and RETURN id (uuid/text) */
+  /**
+   * Save or update meeting document in PostgreSQL
+   * Performs UPSERT operation on documents table using fireflies_id as unique key.
+   * Generates formatted markdown content and stores all metadata.
+   * @param meta - Transcript metadata
+   * @param fileUrl - URL of the markdown file in Supabase Storage
+   * @returns Document ID from the database
+   * @throws Error if upsert fails
+   */
   async saveMeeting(
     meta: TranscriptMetadata,
     fileUrl: string,
   ): Promise<string> {
     this.logger.debug("save document", { fireflies_id: meta.id });
     
-    // Generate the Fireflies link
+    // Generate direct link to Fireflies web interface for this transcript
     const firefliesLink = `https://app.fireflies.ai/view/${meta.id}`;
-    
-    // Format the full markdown content (will be stored in content column)
-    const fireflies = new FirefliesClient("", this.logger); // Temporary instance for formatting
+
+    // Format the full markdown content for database storage
+    // We create a temporary FirefliesClient instance just for formatting
+    // This allows us to reuse the markdown formatting logic
+    const fireflies = new FirefliesClient("", this.logger); // API key not needed for formatting
     const mockTranscript: FirefliesTranscript = {
       id: meta.id,
       title: meta.title,
@@ -488,13 +651,14 @@ class DatabaseService {
     };
     const markdownContent = fireflies.formatTranscriptAsMarkdown(mockTranscript);
     
-    // Handle participants array properly
+    // Handle participants array with defensive type checking
+    // Fireflies sometimes returns participants in different formats
     let participantsArray: string[] = [];
     if (meta.participants) {
       if (Array.isArray(meta.participants)) {
         participantsArray = meta.participants;
       } else if (typeof meta.participants === 'string') {
-        // If it's a comma-separated string, split it
+        // Fallback: If it's a comma-separated string, split it
         participantsArray = (meta.participants as any).split(',').map((p: string) => p.trim());
       }
     }
@@ -509,18 +673,20 @@ class DatabaseService {
       ? meta.summary.bullet_gist
       : [];
     
-    // Use COALESCE to handle empty arrays gracefully - escape JSON properly for SQL
-    const participantsSql = participantsArray.length > 0 
+    // Convert JavaScript arrays to PostgreSQL array format
+    // We use jsonb_array_elements_text to safely handle array conversion
+    // This approach prevents SQL injection and handles special characters
+    const participantsSql = participantsArray.length > 0
       ? `(SELECT array_agg(value) FROM jsonb_array_elements_text('${JSON.stringify(participantsArray).replace(/'/g, "''")}'::jsonb))`
-      : `'{}'::text[]`;
-    
+      : `'{}'::text[]`;  // Empty PostgreSQL array
+
     const actionItemsSql = actionItemsArray.length > 0
       ? `(SELECT array_agg(value) FROM jsonb_array_elements_text('${JSON.stringify(actionItemsArray.map(String)).replace(/'/g, "''")}'::jsonb))`
-      : `'{}'::text[]`;
-    
+      : `'{}'::text[]`;  // Empty PostgreSQL array
+
     const bulletPointsSql = bulletPointsArray.length > 0
       ? `(SELECT array_agg(value) FROM jsonb_array_elements_text('${JSON.stringify(bulletPointsArray.map(String)).replace(/'/g, "''")}'::jsonb))`
-      : `'{}'::text[]`;
+      : `'{}'::text[]`;  // Empty PostgreSQL array
     
     const rows = await this.sql`
       INSERT INTO documents (
@@ -581,13 +747,23 @@ class DatabaseService {
     return documentId;
   }
 
+  /**
+   * Perform semantic search using pgvector
+   * Searches document_chunks table using cosine similarity.
+   * @param queryEmbedding - Vector embedding of the search query
+   * @param options - Search filters and options
+   * @returns Array of search results with similarity scores
+   */
   async vectorSearch(
     queryEmbedding: number[],
     options: SearchOptions = {},
   ): Promise<VectorSearchResult[]> {
     const { limit = 10, threshold = 0.7, filters = {}, includeHighlights } =
       options;
-    // pgvector cosine distance via <=> (assuming embeddings are normalized). Similarity = 1 - distance
+    // Build pgvector search conditions
+    // The <=> operator calculates cosine distance between vectors
+    // We convert to similarity score: similarity = 1 - distance
+    // Threshold filters out results below minimum similarity
     const conds: string[] = [
       `1 - (c.embedding <=> ${
         JSON.stringify(queryEmbedding)
@@ -660,6 +836,11 @@ class DatabaseService {
       ((text || "").split(/\s+/).length > 30 ? "…" : "");
   }
 
+  /**
+   * Generate comprehensive analytics from stored data
+   * Aggregates statistics about meetings, chunks, speakers, and keywords.
+   * @returns Complete analytics data structure
+   */
   async analytics(): Promise<AnalyticsData> {
     const [
       tm,
@@ -702,7 +883,8 @@ class DatabaseService {
       ? Math.round(totalChunks / totalMeetings)
       : 0;
 
-    // Flatten keywords (now they're directly arrays in documents table)
+    // Aggregate keywords across all meetings to find most common topics
+    // Keywords are stored as JSON arrays in the metadata column
     const keywordFreq: Record<string, number> = {};
     for (const row of topKw as any[]) {
       const arr: string[] = JSON.parse(row.keywords || '[]');
@@ -712,6 +894,7 @@ class DatabaseService {
         }
       }
     }
+    // Sort by frequency and take top 20 keywords
     const topKeywords = Object.entries(keywordFreq).sort((a, b) => b[1] - a[1])
       .slice(0, 20).map(([keyword, frequency]) => ({ keyword, frequency }));
 
@@ -776,10 +959,24 @@ class DatabaseService {
   }
 }
 
-// ===== Webhook HMAC =====
+// ============================================================================
+// WEBHOOK HANDLER
+// ============================================================================
+
+/**
+ * Webhook Handler for Fireflies Integration
+ * Handles HMAC signature verification for secure webhook endpoints.
+ * Ensures webhook requests are authentic and from Fireflies.
+ */
 class WebhookHandler {
   constructor(private secret: string | undefined, private logger: Logger) {}
 
+  /**
+   * Verify HMAC signature of incoming webhook request
+   * Uses SHA-256 HMAC with timestamp to prevent replay attacks.
+   * @param req - Incoming webhook request
+   * @returns Verification result with signature details
+   */
   async verifySignature(req: Request): Promise<WebhookVerification> {
     if (!this.secret) return { isValid: true };
     const signature = req.headers.get("X-Fireflies-Signature");
@@ -804,7 +1001,19 @@ class WebhookHandler {
   }
 }
 
-// ===== Transcript Processor (no local embeddings; delegates) =====
+// ============================================================================
+// MAIN TRANSCRIPT PROCESSOR
+// ============================================================================
+
+/**
+ * Transcript Processor - Core Business Logic
+ * Orchestrates the entire transcript processing pipeline:
+ * 1. Fetches transcripts from Fireflies
+ * 2. Uploads to Supabase Storage
+ * 3. Saves metadata to PostgreSQL
+ * 4. Triggers vectorization in separate worker
+ * 5. Provides search and analytics capabilities
+ */
 class TranscriptProcessor {
   private supabase: SupabaseClient;
   private storage: SupabaseStorageService;
@@ -832,12 +1041,20 @@ class TranscriptProcessor {
     );
   }
 
+  /**
+   * Process a single transcript end-to-end
+   * Main processing pipeline that coordinates all services.
+   * Includes idempotency check to prevent duplicate processing.
+   * @param transcriptId - Fireflies transcript ID
+   * @param options - Processing configuration options
+   */
   async processTranscript(
     transcriptId: string,
     options: ProcessingOptions = {},
   ): Promise<void> {
     const log = this.logger.child({ transcriptId });
-    // idempotency: skip if processed flag recently set
+    // Idempotency check: Prevent duplicate processing of the same transcript
+    // Cache flag expires after 1 hour (configured in cache.set below)
     const processedFlag = await this.cache.get("processed", transcriptId);
     if (processedFlag) {
       log.info("recently processed; skip");
@@ -859,6 +1076,12 @@ class TranscriptProcessor {
     log.info("ingest complete; dispatched vectorization", { documentId });
   }
 
+  /**
+   * Batch sync multiple transcripts from Fireflies
+   * Processes transcripts in parallel with configurable batch size.
+   * @param limit - Maximum number of transcripts to sync
+   * @returns Sync result with success/failure counts
+   */
   async syncAllTranscripts(limit?: number): Promise<SyncResult> {
     const batchSize = limit || this.env.SYNC_BATCH_SIZE || 25;
     const list = await this.fireflies.getTranscripts(batchSize);
@@ -890,6 +1113,13 @@ class TranscriptProcessor {
     return res;
   }
 
+  /**
+   * Perform semantic search on transcripts
+   * Delegates to vectorizer worker for query embedding, then searches locally.
+   * @param query - Search query text
+   * @param options - Search filters and configuration
+   * @returns Array of relevant transcript chunks
+   */
   async search(
     query: string,
     options: SearchOptions = {},
@@ -918,6 +1148,12 @@ class TranscriptProcessor {
     await this.db.cleanup();
   }
 
+  /**
+   * Trigger vectorization in separate worker
+   * Sends document ID to vectorizer worker for chunk generation and embedding.
+   * Fire-and-forget pattern - errors are logged but don't fail main processing.
+   * @param documentId - Database document ID to process
+   */
   private async triggerVectorization(documentId: string) {
     const res = await fetch(`${this.env.VECTORIZE_WORKER_URL}/process`, {
       method: "POST",
@@ -938,8 +1174,29 @@ class TranscriptProcessor {
   }
 }
 
-// ===== HTTP Handlers =====
+// ============================================================================
+// CLOUDFLARE WORKER ENTRY POINT
+// ============================================================================
+
+/**
+ * Main Worker Export
+ * Handles HTTP requests and scheduled cron jobs.
+ * Implements all API endpoints and webhook handling.
+ */
 export default {
+  /**
+   * Main HTTP Request Handler
+   * Routes incoming requests to appropriate endpoints.
+   * Implements CORS, rate limiting, and error handling.
+   *
+   * ENDPOINTS:
+   * - GET  /api/health         - Health check and service status
+   * - POST /api/sync           - Batch sync transcripts from Fireflies
+   * - POST /api/process        - Process single transcript by ID
+   * - POST /api/search         - Semantic search (requires vectorizer)
+   * - GET  /api/analytics      - Usage statistics and analytics
+   * - POST /webhook/fireflies  - Webhook endpoint for real-time updates
+   */
   async fetch(
     request: Request,
     env: Env,
@@ -965,16 +1222,18 @@ export default {
       Number(env.RATE_LIMIT_WINDOW || 60),
     );
 
-    // Rate limit non-webhook routes
+    // Apply rate limiting to all non-webhook routes
+    // Webhooks are exempt as they come from trusted Fireflies servers
     if (!url.pathname.startsWith("/webhook")) {
+      // Get client IP from Cloudflare header (most reliable in CF Workers)
       const ip = request.headers.get("CF-Connecting-IP") || "anon";
       const state = await rateLimiter.checkLimit(ip);
       if (!state.allowed) {
         return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
-          status: 429,
+          status: 429,  // HTTP 429 Too Many Requests
           headers: {
             ...cors,
-            ...rateLimiter.getHeaders(state),
+            ...rateLimiter.getHeaders(state),  // Include rate limit headers
             "Content-Type": "application/json",
           },
         });
@@ -983,6 +1242,8 @@ export default {
 
     try {
       switch (url.pathname) {
+        // ========== WEBHOOK ENDPOINT ==========
+        // Receives real-time notifications from Fireflies when transcripts are ready
         case "/webhook/fireflies": {
           if (request.method !== "POST") {
             return new Response("Method not allowed", { status: 405 });
@@ -1009,6 +1270,8 @@ export default {
           });
         }
 
+        // ========== BATCH SYNC ENDPOINT ==========
+        // Synchronizes recent transcripts from Fireflies in bulk
         case "/api/sync": {
           if (request.method !== "POST") {
             return new Response("Method not allowed", { status: 405 });
@@ -1026,6 +1289,8 @@ export default {
           });
         }
 
+        // ========== SINGLE TRANSCRIPT PROCESSING ==========
+        // Process a specific transcript by its Fireflies ID
         case "/api/process": {
           if (request.method !== "POST") {
             return new Response("Method not allowed", { status: 405 });
@@ -1046,6 +1311,9 @@ export default {
           );
         }
 
+        // ========== SEMANTIC SEARCH ENDPOINT ==========
+        // Performs vector similarity search on embedded transcripts
+        // Note: Requires vectorizer worker to be configured
         case "/api/search": {
           if (request.method !== "POST") {
             return new Response("Method not allowed", { status: 405 });
@@ -1065,6 +1333,8 @@ export default {
           });
         }
 
+        // ========== ANALYTICS ENDPOINT ==========
+        // Returns comprehensive usage statistics and insights
         case "/api/analytics": {
           if (request.method !== "GET") {
             return new Response("Method not allowed", { status: 405 });
@@ -1080,6 +1350,8 @@ export default {
           });
         }
 
+        // ========== HEALTH CHECK ENDPOINT ==========
+        // Simple health check for monitoring and uptime checks
         case "/api/health":
         case "/health": {
           return new Response(
@@ -1107,6 +1379,12 @@ export default {
     }
   },
 
+  /**
+   * Scheduled Cron Handler
+   * Automatically syncs transcripts on a schedule (configured in wrangler.toml).
+   * Default schedule: Every 30 minutes
+   * Processes recent transcripts to keep database up-to-date.
+   */
   async scheduled(
     controller: ScheduledController,
     env: Env,
