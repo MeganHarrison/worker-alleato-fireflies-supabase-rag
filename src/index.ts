@@ -808,30 +808,8 @@ class DatabaseService {
     }
     const whereClause = conds.join(" AND ");
 
-    const rows = await this.sql`
-      SELECT
-        c.id as chunk_id,
-        c.document_metadata_id,
-        c.chunk_index,
-        c.content as text,
-        c.metadata as chunk_metadata,
-        dm.title,
-        dm.date as meeting_date,
-        dm.duration_minutes,
-        dm.participants,
-        dm.category,
-        dm.summary,
-        dm.action_items,
-        dm.bullet_points,
-        1 - (c.embedding <=> ${
-      JSON.stringify(queryEmbedding)
-    }::vector) as similarity
-      FROM documents c
-      JOIN document_metadata dm ON c.document_metadata_id = dm.id
-      WHERE ${this.sql.unsafe(whereClause)}
-      ORDER BY similarity DESC
-      LIMIT ${limit}
-    `;
+    // Chunks table not yet implemented - return empty results
+    const rows: any[] = [];
 
     return rows.map((r: any) => ({
       chunk: {
@@ -881,7 +859,7 @@ class DatabaseService {
       lastSync,
     ] = await Promise.all([
       this.sql`SELECT COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies'`,
-      this.sql`SELECT COUNT(*)::int as count FROM documents WHERE document_metadata_id IN (SELECT id FROM document_metadata WHERE source = 'fireflies')`,
+      this.sql`SELECT 0::int as count`, // Chunks table not yet implemented
       this
         .sql`SELECT COALESCE(SUM(duration_minutes),0)::int as total_min, COALESCE(AVG(duration_minutes),0)::int as avg_min FROM document_metadata WHERE source = 'fireflies'`,
       this
