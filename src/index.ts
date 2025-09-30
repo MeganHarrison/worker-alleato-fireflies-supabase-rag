@@ -697,9 +697,8 @@ class DatabaseService {
         title,
         source,
         content,
-        category,
+        type,
         participants,
-        summary,
         action_items,
         bullet_points,
         fireflies_id,
@@ -707,9 +706,7 @@ class DatabaseService {
         date,
         duration_minutes,
         url,
-        metadata,
-        created_at,
-        updated_at
+        created_at
       ) VALUES (
         ${documentId},
         ${meta.title},
@@ -717,7 +714,6 @@ class DatabaseService {
         ${markdownContent},
         ${'meeting'},
         ${this.sql.unsafe(participantsSql)},
-        ${meta.summary?.overview || ''},
         ${this.sql.unsafe(actionItemsSql)},
         ${this.sql.unsafe(bulletPointsSql)},
         ${meta.id},
@@ -725,32 +721,17 @@ class DatabaseService {
         ${new Date(meta.date)},
         ${Math.round((meta.duration || 0) / 60)},
         ${fileUrl},
-        ${JSON.stringify({
-          fireflies_id: meta.id,
-          source: 'fireflies',
-          speaker_count: meta.speakerCount || 0,
-          meeting_date: meta.date,
-          duration_minutes: Math.round((meta.duration || 0) / 60),
-          storage_bucket_path: fileUrl,
-          keywords: Array.isArray(meta.summary?.keywords) ? meta.summary.keywords : [],
-          status: 'pending',
-          raw_summary: meta.summary
-        })},
-        NOW(),
         NOW()
       )
-      ON CONFLICT (fireflies_id) DO UPDATE SET
+      ON CONFLICT (id) DO UPDATE SET
         title = EXCLUDED.title,
         content = EXCLUDED.content,
         participants = EXCLUDED.participants,
-        summary = EXCLUDED.summary,
         action_items = EXCLUDED.action_items,
         bullet_points = EXCLUDED.bullet_points,
         date = EXCLUDED.date,
         duration_minutes = EXCLUDED.duration_minutes,
-        url = EXCLUDED.url,
-        metadata = EXCLUDED.metadata,
-        updated_at = NOW()
+        url = EXCLUDED.url
       RETURNING id
     `;
 
