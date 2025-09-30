@@ -700,10 +700,6 @@ class DatabaseService {
     // Use fireflies_id as the primary ID for document_metadata
     const documentId = meta.id;
 
-    // Get the appropriate summary text
-    // Use gist if available, otherwise fall back to short_summary
-    const summaryText = meta.summary?.gist || meta.summary?.short_summary || '';
-
     const rows = await this.sql`
       INSERT INTO document_metadata (
         id,
@@ -720,6 +716,7 @@ class DatabaseService {
         duration_minutes,
         url,
         overview,
+        description,
         summary,
         tags,
         created_at
@@ -738,7 +735,8 @@ class DatabaseService {
         ${Math.round((meta.duration || 0) / 60)},
         ${fileUrl},
         ${meta.summary?.overview || ''},
-        ${summaryText},
+        ${meta.summary?.gist || ''},
+        ${meta.summary?.short_summary || ''},
         ${this.sql.unsafe(keywordsSql)},
         NOW()
       )
@@ -752,6 +750,7 @@ class DatabaseService {
         duration_minutes = EXCLUDED.duration_minutes,
         url = EXCLUDED.url,
         overview = EXCLUDED.overview,
+        description = EXCLUDED.description,
         summary = EXCLUDED.summary,
         tags = EXCLUDED.tags
       RETURNING id
