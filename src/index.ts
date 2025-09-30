@@ -673,6 +673,11 @@ class DatabaseService {
       ? meta.summary.bullet_gist
       : [];
 
+    // Format keywords/tags array
+    const keywordsArray = Array.isArray(meta.summary?.keywords)
+      ? meta.summary.keywords
+      : [];
+
     // Convert JavaScript arrays to PostgreSQL array format
     // We use jsonb_array_elements_text to safely handle array conversion
     // This approach prevents SQL injection and handles special characters
@@ -688,8 +693,16 @@ class DatabaseService {
       ? `(SELECT array_agg(value) FROM jsonb_array_elements_text('${JSON.stringify(bulletPointsArray.map(String)).replace(/'/g, "''")}'::jsonb))`
       : `'{}'::text[]`;  // Empty PostgreSQL array
 
+    const keywordsSql = keywordsArray.length > 0
+      ? `(SELECT array_agg(value) FROM jsonb_array_elements_text('${JSON.stringify(keywordsArray.map(String)).replace(/'/g, "''")}'::jsonb))`
+      : `'{}'::text[]`;  // Empty PostgreSQL array
+
     // Use fireflies_id as the primary ID for document_metadata
     const documentId = meta.id;
+
+    // Get the appropriate summary text
+    // Use gist if available, otherwise fall back to short_summary
+    const summaryText = meta.summary?.gist || meta.summary?.short_summary || '';
 
     const rows = await this.sql`
       INSERT INTO document_metadata (
@@ -706,6 +719,9 @@ class DatabaseService {
         date,
         duration_minutes,
         url,
+        overview,
+        summary,
+        tags,
         created_at
       ) VALUES (
         ${documentId},
@@ -721,6 +737,9 @@ class DatabaseService {
         ${new Date(meta.date)},
         ${Math.round((meta.duration || 0) / 60)},
         ${fileUrl},
+        ${meta.summary?.overview || ''},
+        ${summaryText},
+        ${this.sql.unsafe(keywordsSql)},
         NOW()
       )
       ON CONFLICT (id) DO UPDATE SET
@@ -731,7 +750,10 @@ class DatabaseService {
         bullet_points = EXCLUDED.bullet_points,
         date = EXCLUDED.date,
         duration_minutes = EXCLUDED.duration_minutes,
-        url = EXCLUDED.url
+        url = EXCLUDED.url,
+        overview = EXCLUDED.overview,
+        summary = EXCLUDED.summary,
+        tags = EXCLUDED.tags
       RETURNING id
     `;
 
