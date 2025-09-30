@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "worker-alleato-fireflies-rag",
+  "name": "alleato-fireflies-sync",
   "main": "src/index.ts",
   "compatibility_date": "2025-08-26",
   
