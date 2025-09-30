@@ -862,8 +862,7 @@ class DatabaseService {
       this.sql`SELECT 0::int as count`, // Chunks table not yet implemented
       this
         .sql`SELECT COALESCE(SUM(duration_minutes),0)::int as total_min, COALESCE(AVG(duration_minutes),0)::int as avg_min FROM document_metadata WHERE source = 'fireflies'`,
-      this
-        .sql`SELECT unnest(participants) as name, COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies' GROUP BY name ORDER BY count DESC LIMIT 10`,
+      this.sql`SELECT NULL as name, 0::int as count`, // unnest might not be available
       this.sql`SELECT NULL as keywords`, // metadata column might not exist
       this.sql`SELECT NULL as department, 0::int as count`, // metadata column might not exist
       this.sql`SELECT NULL as project, 0::int as count`, // projects table might not exist
