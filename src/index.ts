@@ -872,7 +872,7 @@ class DatabaseService {
       this
         .sql`SELECT COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies' AND date >= CURRENT_DATE - INTERVAL '30 days'`,
       this
-        .sql`SELECT MAX(updated_at) as last_sync, COUNT(CASE WHEN created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours' THEN 1 END)::int as last_day_count FROM document_metadata WHERE source = 'fireflies'`,
+        .sql`SELECT MAX(created_at) as last_sync, COUNT(CASE WHEN created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours' THEN 1 END)::int as last_day_count FROM document_metadata WHERE source = 'fireflies'`,
     ]);
 
     const totalMeetings = tm[0]?.count || 0;
