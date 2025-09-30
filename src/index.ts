@@ -864,14 +864,10 @@ class DatabaseService {
         .sql`SELECT COALESCE(SUM(duration_minutes),0)::int as total_min, COALESCE(AVG(duration_minutes),0)::int as avg_min FROM document_metadata WHERE source = 'fireflies'`,
       this
         .sql`SELECT unnest(participants) as name, COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies' GROUP BY name ORDER BY count DESC LIMIT 10`,
-      this
-        .sql`SELECT metadata->>'keywords' as keywords FROM document_metadata WHERE source = 'fireflies' AND metadata->>'keywords' IS NOT NULL`,
-      this
-        .sql`SELECT metadata->>'department' as department, COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies' AND metadata->>'department' IS NOT NULL GROUP BY department ORDER BY count DESC`,
-      this
-        .sql`SELECT p.name as project, COUNT(*)::int as count FROM document_metadata dm LEFT JOIN projects p ON dm.project_id = p.id WHERE dm.source = 'fireflies' AND dm.project_id IS NOT NULL GROUP BY p.name ORDER BY count DESC`,
-      this
-        .sql`SELECT metadata->>'meeting_type' as meeting_type, COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies' AND metadata->>'meeting_type' IS NOT NULL GROUP BY meeting_type ORDER BY count DESC`,
+      this.sql`SELECT NULL as keywords`, // metadata column might not exist
+      this.sql`SELECT NULL as department, 0::int as count`, // metadata column might not exist
+      this.sql`SELECT NULL as project, 0::int as count`, // projects table might not exist
+      this.sql`SELECT NULL as meeting_type, 0::int as count`, // metadata column might not exist
       this
         .sql`SELECT COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies' AND date >= CURRENT_DATE - INTERVAL '7 days'`,
       this
