@@ -155,7 +155,7 @@ Content-Type: application/json
         "department": "Engineering",
         "project": "Mobile App",
         "keywords": ["mobile", "UI", "bug fix", "release"],
-        "fileUrl": "https://lgveqfnpkxvzbnnwuled.supabase.co/storage/v1/object/public/meetings/transcripts/01K374MAQ92EM6Z9BVXT12AT7W.md"
+        "fileUrl": "https://lgveqfnpkxvzbnnwuled.supabase.co/storage/v1/object/public/meetings/01K374MAQ92EM6Z9BVXT12AT7W.md"
       }
     }
   ],
@@ -217,7 +217,7 @@ Content-Type: application/json
   "transcriptId": "01K374MAQ92EM6Z9BVXT12AT7W",
   "chunksCreated": 42,
   "embeddingsGenerated": 42,
-  "fileUrl": "https://lgveqfnpkxvzbnnwuled.supabase.co/storage/v1/object/public/meetings/transcripts/01K374MAQ92EM6Z9BVXT12AT7W.md",
+  "fileUrl": "https://lgveqfnpkxvzbnnwuled.supabase.co/storage/v1/object/public/meetings/01K374MAQ92EM6Z9BVXT12AT7W.md",
   "metadata": {
     "title": "Weekly Team Sync",
     "date": "2025-08-28T15:00:00Z",

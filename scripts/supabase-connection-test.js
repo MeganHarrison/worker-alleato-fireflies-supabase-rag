@@ -73,7 +73,7 @@ async function testConnection() {
     
     // Test 4: Check transcript URL accessibility
     console.log('\n🔗 Testing transcript URL...');
-    const transcriptUrl = "https://lgveqfnpkxvzbnnwuled.supabase.co/storage/v1/object/public/meetings/transcripts/01K374MAQ92EM6Z9BVXT12AT7W.md";
+    const transcriptUrl = "https://lgveqfnpkxvzbnnwuled.supabase.co/storage/v1/object/public/meetings/01K374MAQ92EM6Z9BVXT12AT7W.md";
     
     try {
       const response = await fetch(transcriptUrl);

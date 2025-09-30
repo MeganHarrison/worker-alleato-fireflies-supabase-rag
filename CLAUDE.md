@@ -13,8 +13,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Tech Stack
 
 - **Runtime:** Cloudflare Workers with TypeScript
-- **Database:** Supabase PostgreSQL (uses `documents` and `document_chunks` tables)
-- **Storage:** Supabase Storage for transcript files (bucket: "meetings")
+- **Database:** Supabase PostgreSQL (uses `document_metadata` and `document_chunks` tables)
+- **Storage:** Supabase Storage for transcript files (bucket: "meetings" - root folder)
 - **Caching:** Cloudflare KV for rate limiting and flags
 - **Connection:** Cloudflare Hyperdrive for PostgreSQL optimization
 - **Dependencies:** 
@@ -31,8 +31,8 @@ This worker is an **ingest-only system** with the following responsibilities:
 
 **Owned by THIS worker:**
 - ✅ Fireflies GraphQL client (fetch transcript lists and full transcripts)
-- ✅ Supabase Storage upload of markdown transcripts (with date-title naming)
-- ✅ PostgreSQL insert/upsert of document records 
+- ✅ Supabase Storage upload of markdown transcripts to bucket root (with date-title naming)
+- ✅ PostgreSQL insert/upsert of document_metadata records 
 - ✅ Webhook verification (HMAC) + rate limiting + status endpoints
 - ✅ Dispatch to separate Vectorizer Worker for embeddings
 
@@ -50,8 +50,8 @@ Single-file implementation with embedded classes:
 - **CacheService**: KV-based caching for flags and rate limiting
 - **RateLimiter**: Per-IP sliding window rate limiting
 - **FirefliesClient**: GraphQL API client for fetching transcripts
-- **SupabaseStorageService**: File upload to `meetings/` bucket root with `YYYY-MM-DD - Title.md` naming
-- **DatabaseService**: Direct PostgreSQL operations via Hyperdrive (saves to `documents` table)
+- **SupabaseStorageService**: File upload to `meetings` bucket root with `YYYY-MM-DD - Title.md` naming
+- **DatabaseService**: Direct PostgreSQL operations via Hyperdrive (saves to `document_metadata` table)
 - **WebhookHandler**: HMAC signature verification for Fireflies webhooks  
 - **TranscriptProcessor**: Main orchestrator that coordinates all services
 
@@ -132,18 +132,18 @@ The application uses PostgreSQL with pgvector extension. The schema is defined i
 
 ### Core Tables
 
-- **meetings** table - Transcript metadata, participants, action items, content (THIS worker writes here)
+- **document_metadata** table - Transcript metadata, participants, action items, content (THIS worker writes here)
   - Primary key: `id` (TEXT) - uses Fireflies transcript ID
   - Stores title, date, duration, participants, keywords, action_items
   - File URL pointing to Supabase Storage markdown file
   
-- **meetings_chunks** table - Vectorized transcript chunks with embeddings (Vectorizer worker writes here)
+- **document_chunks** table - Vectorized transcript chunks with embeddings (Vectorizer worker writes here)
   - Primary key: `id` (SERIAL)
-  - Foreign key: `transcript_id` references `meetings(id)`
+  - Foreign key: `document_id` references `document_metadata(id)`
   - Contains 768-dimensional vector embeddings for BGE model
   - Includes speaker information and timing metadata
 
-**Note:** This worker only writes to the `meetings` table. The `meetings_chunks` table is populated by the separate vectorizer worker.
+**Note:** This worker only writes to the `document_metadata` table. The `document_chunks` table is populated by the separate vectorizer worker.
 
 ### Important Schema Details
 - pgvector extension must be enabled: `CREATE EXTENSION IF NOT EXISTS vector;`
@@ -167,7 +167,7 @@ The application uses PostgreSQL with pgvector extension. The schema is defined i
 ## Key Features
 
 1. **Fireflies Integration**: GraphQL API client for fetching transcripts and metadata
-2. **Smart Storage**: Files saved as `YYYY-MM-DD - Meeting Title.md` in Supabase Storage
+2. **Smart Storage**: Files saved as `YYYY-MM-DD - Meeting Title.md` in Supabase Storage bucket root
 3. **Rate Limiting**: Per-IP sliding window rate limiting (100 req/min)
 4. **Batch Processing**: Parallel processing with configurable batch sizes (default: 25)  
 5. **Structured Logging**: JSON logging with context and levels
@@ -283,13 +283,13 @@ Generate Markdown representation
         ↓
 Upload to Supabase Storage
         ↓
-Save metadata to `meetings` table
+Save metadata to `document_metadata` table
         ↓
 Chunk transcript (speaker-aware or simple)
         ↓
 Generate embeddings for each chunk
         ↓
-Save chunks with embeddings to `meetings_chunks` table
+Save chunks with embeddings to `document_chunks` table
 ```
 
 ### 2. Chunking Strategy Details
@@ -324,11 +324,11 @@ Save chunks with embeddings to `meetings_chunks` table
 **Search Process**:
 ```sql
 -- Cosine similarity search with pgvector
-SELECT 
+SELECT
   chunk_id,
   text,
   1 - (embedding <=> query_embedding) as similarity
-FROM meetings_chunks
+FROM document_chunks
 WHERE 
   1 - (embedding <=> query_embedding) > threshold
   AND department = filter_department
@@ -338,13 +338,13 @@ LIMIT 10
 
 ### 4. Database Tables Detail
 
-**meetings table**:
+**document_metadata table**:
 - Primary storage for meeting metadata
 - Arrays for participants, keywords, action_items
 - Tracks department and project for filtering
 - Links to file in Supabase Storage
 
-**meetings_chunks table**:
+**document_chunks table**:
 - Stores individual text chunks
 - 768-dimensional embedding vectors
 - Speaker and timing information
@@ -359,8 +359,8 @@ LIMIT 10
 
 ### Production Deployment
 - **Live URL**: `https://worker-alleato-fireflies-rag.megan-d14.workers.dev`
-- **Database**: 487+ documents successfully ingested
-- **Storage**: 86+ transcript files in Supabase Storage bucket "meetings"
+- **Database**: 487+ documents successfully ingested in document_metadata table
+- **Storage**: 86+ transcript files in Supabase Storage bucket "meetings" (root folder)
 - **Status**: Production-ready ingest system working correctly
 
 ### Current Limitations

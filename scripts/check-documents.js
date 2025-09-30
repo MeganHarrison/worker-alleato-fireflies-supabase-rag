@@ -10,9 +10,9 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 async function checkDocuments() {
   console.log('🚀 Checking Documents Table...\n');
 
-  // Check documents table
+  // Check document_metadata table
   const { count: documentsCount, error: countError } = await supabase
-    .from('documents')
+    .from('document_metadata')
     .select('*', { count: 'exact', head: true });
 
   console.log(`✅ Total Documents in Database: ${documentsCount || 0}`);
@@ -20,7 +20,7 @@ async function checkDocuments() {
   if (documentsCount > 0) {
     // Get recent documents
     const { data: recentDocs, error: recentError } = await supabase
-      .from('documents')
+      .from('document_metadata')
       .select('id, title, source, fireflies_id, date, participants, created_at')
       .order('created_at', { ascending: false })
       .limit(10);
@@ -49,10 +49,10 @@ async function checkDocuments() {
     const { data: files, error: storageError } = await supabase
       .storage
       .from('meetings')
-      .list('transcripts', { limit: 100 });
+      .list('', { limit: 100 });
 
     if (files) {
-      console.log(`\n📁 Storage Files: ${files.length} files in meetings/transcripts/`);
+      console.log(`\n📁 Storage Files: ${files.length} files in meetings bucket (root)`);
       files.slice(0, 5).forEach((file, index) => {
         console.log(`   ${index + 1}. ${file.name} (${(file.metadata?.size / 1024).toFixed(1)}KB)`);
       });

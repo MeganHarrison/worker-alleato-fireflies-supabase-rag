@@ -15,14 +15,14 @@ async function downloadAndCheckFile(fileName) {
   try {
     console.log(`\n📄 Downloading ${fileName}...`);
     
-    // Try both with and without transcripts/ prefix
+    // Try bucket root first (new convention), then transcripts/ prefix (legacy)
     let data, error;
     
-    ({ data, error } = await supabase.storage.from('meetings').download(`transcripts/${fileName}`));
-    
+    ({ data, error } = await supabase.storage.from('meetings').download(fileName));
+
     if (error) {
-      // Try without prefix
-      ({ data, error } = await supabase.storage.from('meetings').download(fileName));
+      // Try with transcripts/ prefix for legacy files
+      ({ data, error } = await supabase.storage.from('meetings').download(`transcripts/${fileName}`));
     }
     
     if (error) {

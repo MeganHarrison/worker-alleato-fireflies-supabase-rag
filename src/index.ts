@@ -621,7 +621,7 @@ class DatabaseService {
 
   /**
    * Save or update meeting document in PostgreSQL
-   * Performs UPSERT operation on documents table using fireflies_id as unique key.
+   * Performs UPSERT operation on document_metadata table using fireflies_id as unique key.
    * Generates formatted markdown content and stores all metadata.
    * @param meta - Transcript metadata
    * @param fileUrl - URL of the markdown file in Supabase Storage
@@ -632,8 +632,8 @@ class DatabaseService {
     meta: TranscriptMetadata,
     fileUrl: string,
   ): Promise<string> {
-    this.logger.debug("save document", { fireflies_id: meta.id });
-    
+    this.logger.debug("save document_metadata", { fireflies_id: meta.id });
+
     // Generate direct link to Fireflies web interface for this transcript
     const firefliesLink = `https://app.fireflies.ai/view/${meta.id}`;
 
@@ -650,7 +650,7 @@ class DatabaseService {
       summary: meta.summary,
     };
     const markdownContent = fireflies.formatTranscriptAsMarkdown(mockTranscript);
-    
+
     // Handle participants array with defensive type checking
     // Fireflies sometimes returns participants in different formats
     let participantsArray: string[] = [];
@@ -662,17 +662,17 @@ class DatabaseService {
         participantsArray = (meta.participants as any).split(',').map((p: string) => p.trim());
       }
     }
-    
+
     // Format action_items array
-    const actionItemsArray = Array.isArray(meta.summary?.action_items) 
-      ? meta.summary.action_items 
+    const actionItemsArray = Array.isArray(meta.summary?.action_items)
+      ? meta.summary.action_items
       : [];
-    
-    // Format bullet_points array  
+
+    // Format bullet_points array
     const bulletPointsArray = Array.isArray(meta.summary?.bullet_gist)
       ? meta.summary.bullet_gist
       : [];
-    
+
     // Convert JavaScript arrays to PostgreSQL array format
     // We use jsonb_array_elements_text to safely handle array conversion
     // This approach prevents SQL injection and handles special characters
@@ -687,11 +687,15 @@ class DatabaseService {
     const bulletPointsSql = bulletPointsArray.length > 0
       ? `(SELECT array_agg(value) FROM jsonb_array_elements_text('${JSON.stringify(bulletPointsArray.map(String)).replace(/'/g, "''")}'::jsonb))`
       : `'{}'::text[]`;  // Empty PostgreSQL array
-    
+
+    // Use fireflies_id as the primary ID for document_metadata
+    const documentId = meta.id;
+
     const rows = await this.sql`
-      INSERT INTO documents (
-        title, 
-        source, 
+      INSERT INTO document_metadata (
+        id,
+        title,
+        source,
         content,
         category,
         participants,
@@ -701,10 +705,13 @@ class DatabaseService {
         fireflies_id,
         fireflies_link,
         date,
+        duration_minutes,
+        url,
         metadata,
         created_at,
         updated_at
       ) VALUES (
+        ${documentId},
         ${meta.title},
         ${'fireflies'},
         ${markdownContent},
@@ -716,8 +723,10 @@ class DatabaseService {
         ${meta.id},
         ${firefliesLink},
         ${new Date(meta.date)},
-        ${JSON.stringify({ 
-          fireflies_id: meta.id, 
+        ${Math.round((meta.duration || 0) / 60)},
+        ${fileUrl},
+        ${JSON.stringify({
+          fireflies_id: meta.id,
           source: 'fireflies',
           speaker_count: meta.speakerCount || 0,
           meeting_date: meta.date,
@@ -738,18 +747,24 @@ class DatabaseService {
         action_items = EXCLUDED.action_items,
         bullet_points = EXCLUDED.bullet_points,
         date = EXCLUDED.date,
+        duration_minutes = EXCLUDED.duration_minutes,
+        url = EXCLUDED.url,
         metadata = EXCLUDED.metadata,
         updated_at = NOW()
       RETURNING id
     `;
-    const documentId = rows[0]?.id as string;
-    if (!documentId) throw new Error("Failed to upsert document");
+
+    if (!rows || rows.length === 0) {
+      throw new Error("Failed to upsert document_metadata");
+    }
+
     return documentId;
   }
 
   /**
    * Perform semantic search using pgvector
-   * Searches document_chunks table using cosine similarity.
+   * Searches documents table (chunks) using cosine similarity.
+   * Joins with document_metadata for full document information.
    * @param queryEmbedding - Vector embedding of the search query
    * @param options - Search filters and options
    * @returns Array of search results with similarity scores
@@ -771,38 +786,48 @@ class DatabaseService {
     ];
     if (filters.department) {
       conds.push(
-        `d.metadata->>'department' = ${
+        `dm.metadata->>'department' = ${
           this.sql.unsafe(`'${filters.department.replace(/'/g, "''")}'`)
         }`,
       );
     }
     if (filters.project) {
       conds.push(
-        `d.project_id::text = ${
+        `dm.project_id::text = ${
           this.sql.unsafe(`'${filters.project.replace(/'/g, "''")}'`)
         }`,
       );
     }
     if (filters.dateFrom) {
       conds.push(
-        `d.meeting_date >= ${this.sql.unsafe(`'${filters.dateFrom}'`)}`,
+        `dm.date >= ${this.sql.unsafe(`'${filters.dateFrom}'`)}`,
       );
     }
     if (filters.dateTo) {
-      conds.push(`d.meeting_date <= ${this.sql.unsafe(`'${filters.dateTo}'`)}`);
+      conds.push(`dm.date <= ${this.sql.unsafe(`'${filters.dateTo}'`)}`);
     }
     const whereClause = conds.join(" AND ");
 
     const rows = await this.sql`
-      SELECT 
-        c.document_id, c.chunk_index, c.content as text, c.metadata as chunk_metadata,
-        d.title, d.metadata->>'meeting_date' as meeting_date, (d.metadata->>'duration_minutes')::int as duration_minutes, d.participants, 
-        d.category, d.summary, d.action_items, d.bullet_points,
+      SELECT
+        c.id as chunk_id,
+        c.document_metadata_id,
+        c.chunk_index,
+        c.content as text,
+        c.metadata as chunk_metadata,
+        dm.title,
+        dm.date as meeting_date,
+        dm.duration_minutes,
+        dm.participants,
+        dm.category,
+        dm.summary,
+        dm.action_items,
+        dm.bullet_points,
         1 - (c.embedding <=> ${
       JSON.stringify(queryEmbedding)
     }::vector) as similarity
-      FROM document_chunks c
-      JOIN documents d ON c.document_id = d.id
+      FROM documents c
+      JOIN document_metadata dm ON c.document_metadata_id = dm.id
       WHERE ${this.sql.unsafe(whereClause)}
       ORDER BY similarity DESC
       LIMIT ${limit}
@@ -810,11 +835,11 @@ class DatabaseService {
 
     return rows.map((r: any) => ({
       chunk: {
-        document_id: r.document_id,
+        document_id: r.document_metadata_id,
         chunk_index: r.chunk_index,
         text: r.text,
         metadata: r.chunk_metadata,
-        embedding: r.embedding,
+        chunk_id: r.chunk_id,
       },
       similarity: Number(r.similarity),
       metadata: {
@@ -855,26 +880,26 @@ class DatabaseService {
       lastM,
       lastSync,
     ] = await Promise.all([
-      this.sql`SELECT COUNT(*)::int as count FROM documents WHERE source = 'fireflies'`,
-      this.sql`SELECT COUNT(*)::int as count FROM document_chunks WHERE document_id IN (SELECT id FROM documents WHERE source = 'fireflies')`,
+      this.sql`SELECT COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies'`,
+      this.sql`SELECT COUNT(*)::int as count FROM documents WHERE document_metadata_id IN (SELECT id FROM document_metadata WHERE source = 'fireflies')`,
       this
-        .sql`SELECT COALESCE(SUM(duration_minutes),0)::int as total_min, COALESCE(AVG(duration_minutes),0)::int as avg_min FROM documents WHERE source = 'fireflies'`,
+        .sql`SELECT COALESCE(SUM(duration_minutes),0)::int as total_min, COALESCE(AVG(duration_minutes),0)::int as avg_min FROM document_metadata WHERE source = 'fireflies'`,
       this
-        .sql`SELECT unnest(participants) as name, COUNT(*)::int as count FROM documents WHERE source = 'fireflies' GROUP BY name ORDER BY count DESC LIMIT 10`,
+        .sql`SELECT unnest(participants) as name, COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies' GROUP BY name ORDER BY count DESC LIMIT 10`,
       this
-        .sql`SELECT metadata->>'keywords' as keywords FROM documents WHERE source = 'fireflies' AND metadata->>'keywords' IS NOT NULL`,
+        .sql`SELECT metadata->>'keywords' as keywords FROM document_metadata WHERE source = 'fireflies' AND metadata->>'keywords' IS NOT NULL`,
       this
-        .sql`SELECT metadata->>'department' as department, COUNT(*)::int as count FROM documents WHERE source = 'fireflies' AND metadata->>'department' IS NOT NULL GROUP BY department ORDER BY count DESC`,
+        .sql`SELECT metadata->>'department' as department, COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies' AND metadata->>'department' IS NOT NULL GROUP BY department ORDER BY count DESC`,
       this
-        .sql`SELECT p.name as project, COUNT(*)::int as count FROM documents d LEFT JOIN projects p ON d.project_id = p.id WHERE d.source = 'fireflies' AND d.project_id IS NOT NULL GROUP BY p.name ORDER BY count DESC`,
+        .sql`SELECT p.name as project, COUNT(*)::int as count FROM document_metadata dm LEFT JOIN projects p ON dm.project_id = p.id WHERE dm.source = 'fireflies' AND dm.project_id IS NOT NULL GROUP BY p.name ORDER BY count DESC`,
       this
-        .sql`SELECT metadata->>'meeting_type' as meeting_type, COUNT(*)::int as count FROM documents WHERE source = 'fireflies' AND metadata->>'meeting_type' IS NOT NULL GROUP BY meeting_type ORDER BY count DESC`,
+        .sql`SELECT metadata->>'meeting_type' as meeting_type, COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies' AND metadata->>'meeting_type' IS NOT NULL GROUP BY meeting_type ORDER BY count DESC`,
       this
-        .sql`SELECT COUNT(*)::int as count FROM documents WHERE source = 'fireflies' AND meeting_date >= CURRENT_DATE - INTERVAL '7 days'`,
+        .sql`SELECT COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies' AND date >= CURRENT_DATE - INTERVAL '7 days'`,
       this
-        .sql`SELECT COUNT(*)::int as count FROM documents WHERE source = 'fireflies' AND meeting_date >= CURRENT_DATE - INTERVAL '30 days'`,
+        .sql`SELECT COUNT(*)::int as count FROM document_metadata WHERE source = 'fireflies' AND date >= CURRENT_DATE - INTERVAL '30 days'`,
       this
-        .sql`SELECT MAX(updated_at) as last_sync, COUNT(CASE WHEN created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours' THEN 1 END)::int as last_day_count FROM documents WHERE source = 'fireflies'`,
+        .sql`SELECT MAX(updated_at) as last_sync, COUNT(CASE WHEN created_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours' THEN 1 END)::int as last_day_count FROM document_metadata WHERE source = 'fireflies'`,
     ]);
 
     const totalMeetings = tm[0]?.count || 0;

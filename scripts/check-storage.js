@@ -11,11 +11,11 @@ async function checkStorageFiles() {
   console.log('🚀 Checking Storage Files...\n');
 
   try {
-    // Get all files in the transcripts folder
+    // Get all files in the meetings bucket root
     const { data: files, error } = await supabase
       .storage
       .from('meetings')
-      .list('transcripts', { 
+      .list('', { 
         limit: 100,
         sortBy: { column: 'created_at', order: 'desc' }
       });
@@ -25,10 +25,10 @@ async function checkStorageFiles() {
       return;
     }
 
-    console.log(`📁 Total files in meetings/transcripts/: ${files.length}`);
+    console.log(`📁 Total files in meetings bucket (root): ${files.length}`);
     
     // Show recent files to see naming convention
-    console.log('\n📊 Recent Files (showing new naming convention):');
+    console.log('\n📊 Recent Files in bucket root (showing new naming convention):');
     files.slice(0, 10).forEach((file, index) => {
       const size = (file.metadata?.size / 1024).toFixed(1);
       const created = new Date(file.created_at).toLocaleString();

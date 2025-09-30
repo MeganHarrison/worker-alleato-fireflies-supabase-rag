@@ -21,7 +21,7 @@ A Cloudflare Worker that automatically syncs meeting transcripts from Fireflies.
 1. **Fireflies Integration**: Fetches transcripts via GraphQL API
 2. **Metadata Extraction**: Extracts title, date, participants, keywords, action items
 3. **File Storage**: Saves transcripts as Markdown files in Supabase Storage
-4. **Database Records**: Stores metadata in PostgreSQL `documents` table
+4. **Database Records**: Stores metadata in PostgreSQL `document_metadata` table
 5. **Webhook Processing**: Handles real-time Fireflies webhook events
 6. **Batch Sync**: Processes multiple transcripts in parallel batches
 
@@ -69,7 +69,7 @@ A Cloudflare Worker that automatically syncs meeting transcripts from Fireflies.
                         ┌──────────────────┐     ┌─────────────────┐
                         │ Vectorizer Worker│     │ Stored Files    │
                         │ (Separate System)│     │ meetings/       │
-                        └──────────────────┘     │ transcripts/    │
+                        └──────────────────┘     │ (root folder)   │
                                                  └─────────────────┘
 ```
 
@@ -77,8 +77,8 @@ A Cloudflare Worker that automatically syncs meeting transcripts from Fireflies.
 
 ### 🗄️ PostgreSQL Tables (via Supabase)
 
-#### `documents` Table
-**Purpose**: Stores meeting metadata and full content  
+#### `document_metadata` Table
+**Purpose**: Stores meeting metadata and full content
 **Written by**: This ingest worker  
 
 | Column | Type | Description |
@@ -106,7 +106,7 @@ A Cloudflare Worker that automatically syncs meeting transcripts from Fireflies.
 | Column | Type | Description |
 |--------|------|-------------|
 | id | UUID | Chunk identifier |
-| document_id | UUID | Foreign key to documents.id |
+| document_id | UUID | Foreign key to document_metadata.id |
 | content | TEXT | Chunk text content |
 | metadata | JSONB | Speaker, timing, thread info |
 | embedding | vector(768) | 768-dimensional vector embedding |
@@ -114,7 +114,7 @@ A Cloudflare Worker that automatically syncs meeting transcripts from Fireflies.
 ### 📁 Supabase Storage
 
 #### Bucket: `meetings`
-**Path Structure**: `transcripts/{filename}`  
+**Path Structure**: Files saved directly to bucket root
 **Naming Convention**: `YYYY-MM-DD - Meeting Title.md`
 
 **Examples**:
@@ -132,11 +132,10 @@ A Cloudflare Worker that automatically syncs meeting transcripts from Fireflies.
 
 ```
 Supabase Storage: meetings/
-└── transcripts/
-    ├── 2025-09-15 - Weekly Team Standup.md
-    ├── 2025-09-15 - Product Review Meeting.md
-    ├── 2025-09-14 - Client Strategy Session.md
-    └── ... (487+ files currently stored)
+├── 2025-09-15 - Weekly Team Standup.md
+├── 2025-09-15 - Product Review Meeting.md
+├── 2025-09-14 - Client Strategy Session.md
+└── ... (487+ files currently stored)
 ```
 
 ## How It's Triggered
@@ -459,12 +458,12 @@ Old format (legacy files):
 This ingest worker is designed to work with a separate vectorizer worker:
 
 ### What This Worker Provides
-- Clean, structured transcript data in `documents` table
+- Clean, structured transcript data in `document_metadata` table
 - Standardized metadata format
 - Reliable file storage in Supabase
 
 ### What Vectorizer Worker Should Do
-- Read from `documents` table
+- Read from `document_metadata` table
 - Chunk transcript content (speaker-aware)
 - Generate embeddings using OpenAI/Cloudflare AI
 - Populate `document_chunks` table
@@ -472,7 +471,7 @@ This ingest worker is designed to work with a separate vectorizer worker:
 
 ### Integration Flow
 ```
-Ingest Worker → documents table → Vectorizer Worker → document_chunks table
+Ingest Worker → document_metadata table → Vectorizer Worker → document_chunks table
 ```
 
 ## Troubleshooting
@@ -514,8 +513,8 @@ npx wrangler tail --format=pretty
 
 To build a complete RAG system:
 
-1. **Deploy Vectorizer Worker**: 
-   - Chunk transcripts from `documents` table
+1. **Deploy Vectorizer Worker**:
+   - Chunk transcripts from `document_metadata` table
    - Generate embeddings 
    - Populate `document_chunks` table
 
