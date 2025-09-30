@@ -1153,20 +1153,38 @@ class TranscriptProcessor {
    * @param documentId - Database document ID to process
    */
   private async triggerVectorization(documentId: string) {
-    const res = await fetch(`${this.env.VECTORIZE_WORKER_URL}/process`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${this.env.WORKER_AUTH_TOKEN}`,
-      },
-      body: JSON.stringify({ documentId }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
+    // Skip vectorization if worker URL is not configured
+    if (!this.env.VECTORIZE_WORKER_URL) {
+      this.logger.info(
+        "vectorization skipped - VECTORIZE_WORKER_URL not configured",
+        { documentId }
+      );
+      return;
+    }
+
+    try {
+      const res = await fetch(`${this.env.VECTORIZE_WORKER_URL}/process`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.env.WORKER_AUTH_TOKEN}`,
+        },
+        body: JSON.stringify({ documentId }),
+      });
+      if (!res.ok) {
+        const body = await res.text();
+        this.logger.error(
+          "vectorization trigger failed",
+          new Error(String(res.status)),
+          { body },
+        );
+      }
+    } catch (error) {
+      // Log error but don't throw - vectorization is optional
       this.logger.error(
-        "vectorization trigger failed",
-        new Error(String(res.status)),
-        { body },
+        "vectorization trigger error",
+        error as Error,
+        { documentId }
       );
     }
   }
